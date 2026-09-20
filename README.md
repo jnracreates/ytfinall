@@ -211,3 +211,11 @@ replace docker compose pull with docker compose build.
 ## License
 
 [MIT](LICENSE)
+
+## Support this project
+
+If you find ytfinall useful and want to say thanks:
+
+- [GitHub Sponsors](https://github.com/sponsors/jnracreates) — monthly or one-time
+- [Ko-fi](https://ko-fi.com/jnracreates) — one-time
+- [Buy Me a Coffee](https://buymeacoffee.com/jnracreates) — one-time
