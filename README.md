@@ -204,6 +204,8 @@ replace docker compose pull with docker compose build.
     its ID stays in the archive — the video will not be re-downloaded
     unless the archive is cleared.
 
-License
+### License
 
-MIT
+## License
+
+[MIT](LICENSE)
