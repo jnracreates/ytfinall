@@ -2,6 +2,8 @@
   <img width="290" alt="logo" src="https://github.com/user-attachments/assets/95b2ec77-52bb-42d8-b10d-793fce851dc9" />
 </p>
 
+![License](https://img.shields.io/github/license/jnracreates/ytfinall?style=flat)
+
 # ytfinall
 
 A companion web app for Jellyfin. Users log in with their Jellyfin
