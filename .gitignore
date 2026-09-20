@@ -1,0 +1,7 @@
+media/
+app-data/
+config/cookies.txt
+__pycache__/
+*.pyc
+.env
+config/cookies.txt.bak

@@ -1,0 +1,16 @@
+services:
+  ytfinall:
+    build: .
+    # After you publish the image, comment out `build: .` and uncomment:
+    # image: ghcr.io/jnracreates/ytfinall:latest
+    container_name: ytfinall
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${MEDIA_PATH}:/media/users
+      - ${APP_DATA_PATH}:/app-data
+      - ${CONFIG_PATH}:/config
+      - ${JELLYFIN_CONFIG_PATH}:/jellyfin-config
+    ports:
+      - "6842:6842"
+    restart: unless-stopped
