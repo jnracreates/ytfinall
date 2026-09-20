@@ -1,3 +1,5 @@
+<img width="290" alt="logo" src="https://github.com/user-attachments/assets/95b2ec77-52bb-42d8-b10d-793fce851dc9" />
+
 # ytfinall
 
 Companion web app for Jellyfin: users log in with their Jellyfin account,
