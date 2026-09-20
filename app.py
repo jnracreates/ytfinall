@@ -182,6 +182,17 @@ def extra_ytdlp_args():
     return raw.split() if raw else []
 
 
+DONATION_MESSAGE = (
+    "If you enjoy what I do, consider supporting me! "
+    "Every little bit means the world!"
+)
+DONATION_LINKS = [
+    ("Support via Stripe", "https://buy.stripe.com/aFa00i5cia9M6Jt5y5eME00"),
+    ("Ko-fi", "https://ko-fi.com/jnracreates"),
+    ("Buy Me a Coffee", "https://buymeacoffee.com/jnracreates"),
+]
+
+
 def index_interval_hours():
     return int(get_config("index_interval_hours", 12))
 
@@ -899,6 +910,14 @@ a:hover{text-decoration:underline}
 .info-box ul { margin: 6px 0 0 0; padding-left: 20px; }
 .info-box li { margin-bottom: 4px; }
 .field-group { margin-bottom: 14px; }
+
+/* Donation footer */
+.donate-footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #e1e6eb; text-align: center; }
+.donate-message { font-size: 14px; color: #444; margin-bottom: 12px; font-style: italic; }
+.donate-title { font-size: 13px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
+.donate-links { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+.donate-link { display: inline-block; padding: 8px 16px; background: #f7f9fb; border: 1px solid #e1e6eb; border-radius: 6px; color: #00a4dc; font-size: 14px; font-weight: 600; text-decoration: none; transition: background 0.15s, border-color 0.15s; }
+.donate-link:hover { background: #e3f2fd; border-color: #00a4dc; text-decoration: none; }
 """
 
 LOGIN_PAGE = """
@@ -1124,6 +1143,17 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 </tr>
 {% endfor %}
 </table>
+
+<div class="donate-footer">
+  <div class="donate-message">{{ donation_message }}</div>
+  <div class="donate-title">Support this project</div>
+  <div class="donate-links">
+    {% for label, url in donation_links %}
+      <a href="{{ url }}" target="_blank" rel="noopener noreferrer" class="donate-link">{{ label }}</a>
+    {% endfor %}
+  </div>
+</div>
+
 </body></html>
 """
 
@@ -1539,6 +1569,8 @@ def index():
         is_admin=session.get("is_admin", False),
         max_lookback=max_lookback_days(),
         max_retention=max_retention_days(),
+        donation_links=DONATION_LINKS,
+        donation_message=DONATION_MESSAGE,
     )
 
 
