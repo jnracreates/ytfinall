@@ -1,5 +1,6 @@
 import os, sqlite3, subprocess, threading, time, datetime, requests, shutil, re
-from flask import Flask, request, redirect, render_template_string, session
+from flask import Flask, request, redirect, render_template_string, session, jsonify
+from flask_cors import CORS
 
 def apply_animated_library_cover(user_media_folder):
     """
@@ -27,6 +28,7 @@ def apply_animated_library_cover(user_media_folder):
 
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 MEDIA_ROOT = "/media/users"
 STAGING_ROOT = "/app-data/staging"
@@ -206,6 +208,7 @@ def cleanup_interval_hours():
 # ------------------------------------------------------------------
 _last_update = 0.0
 _update_lock = threading.Lock()
+_download_lock = threading.Lock()
 
 
 def ensure_ytdlp_updated(force=False):
@@ -729,6 +732,12 @@ def fix_one_off_nfo(staging_dir):
 
 
 def run_download(user_id, url, custom_name=None, cutoff_date=None):
+    print(f"[download] queued: {url} for user {user_id}", flush=True)
+    with _download_lock:
+        _run_download_locked(user_id, url, custom_name, cutoff_date)
+
+
+def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
     ensure_ytdlp_updated()
     cmd, staging_dir = build_ytdlp_cmd(user_id, url, custom_name, cutoff_date)
     print(f"[download] starting {url} for user {user_id}", flush=True)
@@ -1039,7 +1048,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
       <input name="url" required placeholder="https://www.youtube.com/watch?v=...">
       <label for="info-oneoff" class="info-btn">ⓘ Info</label>
     </div>
-    <p class="small" style="margin-top:-6px">Paste a single video URL. It goes into a shared <strong>One-Off Videos</strong> folder in your library.</p>
+    <p class="small" style="margin-top:6px">Paste a single video URL. It goes into a shared <strong>One-Off Videos</strong> folder in your library.</p>
     <input type="checkbox" id="info-oneoff" class="info-toggle">
     <div class="info-box">
       <strong>One-off videos:</strong> For individual videos you don't want to subscribe to a whole channel for. Each video is placed in <code>One-Off Videos/Season YYYY/</code> inside your library. Retention works the same as for channels.
@@ -1098,7 +1107,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
       <input name="cutoff" type="date">
       <label for="info-cutoff" class="info-btn">ⓘ Info</label>
     </div>
-    <p class="small" style="margin-top:-6px">Leave blank to download the last <strong>7 days</strong>.</p>
+    <p class="small" style="margin-top:6px">Leave blank to download the last <strong>7 days</strong>.</p>
     <input type="checkbox" id="info-cutoff" class="info-toggle">
     <div class="info-box">
       <strong>How it works:</strong>
@@ -1135,10 +1144,12 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
   <td>{{ s.cutoff or "Last 7 days" }}</td>
   <td>{{ s.retention_days }} days</td>
   <td>
-    <a href="/edit/{{ s.id }}"><button type="button" style="margin-right:6px">Edit</button></a>
-    <form method="post" action="/delete/{{ s.id }}" style="display:inline;margin:0">
-      <button type="submit">Remove</button>
-    </form>
+    <div style="display:flex;gap:8px;align-items:center">
+      <a href="/edit/{{ s.id }}"><button type="button">Edit</button></a>
+      <form method="post" action="/delete/{{ s.id }}" style="margin:0">
+        <button type="submit">Remove</button>
+      </form>
+    </div>
   </td>
 </tr>
 {% endfor %}
@@ -1465,7 +1476,7 @@ EDIT_PAGE = """
       <input name="cutoff" type="date" value="{{ s.cutoff or '' }}">
       <label for="edit-cutoff" class="info-btn">ⓘ Info</label>
     </div>
-    <p class="small" style="margin-top:-6px">Leave blank to download the last <strong>7 days</strong>.</p>
+    <p class="small" style="margin-top:6px">Leave blank to download the last <strong>7 days</strong>.</p>
     <input type="checkbox" id="edit-cutoff" class="info-toggle">
     <div class="info-box">
       <strong>How it works:</strong>
@@ -1845,6 +1856,105 @@ def settings():
         cookies_present=os.path.exists(COOKIES_FILE),
         ok=None, error=None,
     )
+
+
+# ------------------------------------------------------------------
+# Browser Extension API
+# ------------------------------------------------------------------
+
+@app.route("/api/extension-login", methods=["POST"])
+def api_extension_login():
+    """Login for the browser extension. Trades Jellyfin credentials for a token."""
+    data = request.get_json(silent=True)
+    if not data or not data.get("username") or not data.get("password"):
+        return jsonify({"error": "Username and password required"}), 400
+
+    uid, token = jellyfin_login(data["username"], data["password"])
+    if not uid or not token:
+        return jsonify({"error": "Invalid Jellyfin credentials"}), 401
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE user_id=?", (uid,)
+        ).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO users (user_id, username, is_admin) VALUES (?,?,0)",
+                (uid, data["username"]),
+            )
+            threading.Thread(
+                target=ensure_user_library,
+                args=(uid, data["username"]),
+                daemon=True,
+            ).start()
+
+    return jsonify({
+        "token": token,
+        "user_id": uid,
+        "username": data["username"],
+    }), 200
+
+
+@app.route("/api/download", methods=["POST"])
+def api_download():
+    """Endpoint for the browser extension to queue a download."""
+    data = request.get_json(silent=True)
+    if not data or not data.get("url") or not data.get("token"):
+        return jsonify({"error": "url and token are required"}), 400
+
+    target_url = data["url"].strip()
+    user_token = data["token"].strip()
+
+    # Validate the token with Jellyfin
+    try:
+        resp = requests.get(
+            f"{jellyfin_url()}/Users/Me",
+            headers={"Authorization": f'MediaBrowser Token="{user_token}"'},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        user_data = resp.json()
+        user_id = user_data["Id"]
+        username = user_data["Name"]
+    except Exception as e:
+        print(f"[api] Token validation failed: {e}", flush=True)
+        return jsonify({"error": "Authentication failed"}), 401
+
+    # Ensure the user exists locally
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO users (user_id, username, is_admin) VALUES (?,?,0)",
+                (user_id, username),
+            )
+            threading.Thread(
+                target=ensure_user_library,
+                args=(user_id, username),
+                daemon=True,
+            ).start()
+
+    # Determine type and queue download
+    is_single = (
+        ("youtube.com/watch" in target_url or "youtu.be/" in target_url)
+        and "list=" not in target_url
+    )
+    url_type = "video" if is_single else "channel"
+
+    print(f"[api] {username} queued {url_type}: {target_url}", flush=True)
+    threading.Thread(
+        target=run_download,
+        args=(user_id, target_url),
+        daemon=True,
+    ).start()
+
+    return jsonify({
+        "status": "queued",
+        "type_detected": url_type,
+        "message": f"Processing {url_type} for {username}.",
+    }), 200
 
 
 if __name__ == "__main__":
