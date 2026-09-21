@@ -1002,7 +1002,7 @@ a:hover{text-decoration:underline}
 """
 
 LOGIN_PAGE = """
-<!DOCTYPE html><html><head><title>ytfinall — Login</title>
+<!DOCTYPE html><html><head><title>ytfinall — Login</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <img src="/static/logo.png" alt="ytfinall" class="logo">
 <p>Log in with your Jellyfin account.</p>
@@ -1018,7 +1018,7 @@ LOGIN_PAGE = """
 """
 
 SETUP_PAGE = """
-<!DOCTYPE html><html><head><title>ytfinall — Setup</title>
+<!DOCTYPE html><html><head><title>ytfinall — Setup</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <img src="/static/logo.png" alt="ytfinall" class="logo">
 <h2>Welcome to ytfinall</h2>
@@ -1099,7 +1099,7 @@ SETUP_PAGE = """
 """
 
 DASHBOARD = """
-<!DOCTYPE html><html><head><title>ytfinall</title>
+<!DOCTYPE html><html><head><title>ytfinall</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <div class="header">
   <img src="/static/logo.png" alt="ytfinall" class="logo-sm">
@@ -1241,7 +1241,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 """
 
 SETTINGS_PAGE = """
-<!DOCTYPE html><html><head><title>ytfinall — Settings</title>
+<!DOCTYPE html><html><head><title>ytfinall — Settings</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <img src="/static/logo.png" alt="ytfinall" class="logo">
 <h2>Admin settings</h2>
@@ -1586,7 +1586,7 @@ document.querySelectorAll('.admin-archive-btn').forEach(btn => {
 """
 
 EDIT_PAGE = """
-<!DOCTYPE html><html><head><title>ytfinall — Edit source</title>
+<!DOCTYPE html><html><head><title>ytfinall — Edit source</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <img src="/static/logo.png" alt="ytfinall" class="logo">
 <h2>Edit source</h2>
