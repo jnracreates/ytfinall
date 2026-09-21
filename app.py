@@ -203,6 +203,35 @@ def cleanup_interval_hours():
     return int(get_config("cleanup_interval_hours", 24))
 
 
+def archive_stats(user_id):
+    """Return (entry_count, file_exists) for a user's download archive."""
+    path = f"/app-data/{user_id}/archive.txt"
+    if not os.path.exists(path):
+        return 0, False
+    with open(path) as f:
+        return sum(1 for line in f if line.strip()), True
+
+
+def build_user_list():
+    """Return a list of users with their source and archive counts."""
+    result = []
+    with db() as conn:
+        users = conn.execute("SELECT user_id, username FROM users").fetchall()
+        for u in users:
+            src_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM sources WHERE user_id=?",
+                (u["user_id"],),
+            ).fetchone()["c"]
+            arc_count, _ = archive_stats(u["user_id"])
+            result.append({
+                "user_id": u["user_id"],
+                "username": u["username"] or u["user_id"],
+                "sources": src_count,
+                "archive_count": arc_count,
+            })
+    return result
+
+
 # ------------------------------------------------------------------
 # yt-dlp auto-update (throttled)
 # ------------------------------------------------------------------
@@ -297,7 +326,9 @@ def _create_jellyfin_library(lib_name, path):
         "LibraryOptions": {
             "EnableRealtimeMonitor": True,
             "SaveLocalMetadata": False,
+            "MetadataSavers": [],
             "EnableInternetProviders": True,
+            "PathInfos": [{"Path": path}],
             "TypeOptions": [
                 {
                     "Type": "Series",
@@ -385,12 +416,31 @@ def _update_jellyfin_library_options(lib_id, lib_name):
         "Content-Type": "application/json",
     }
 
+    # Fetch the library paths so we do not wipe them on options update.
+    current_paths = []
+    try:
+        r = requests.get(
+            f"{url}/Library/VirtualFolders",
+            headers={"Authorization": f'MediaBrowser Token="{api_key}"'},
+            timeout=15,
+        )
+        for lib in r.json():
+            if lib.get("ItemId") == lib_id:
+                paths = lib.get("Locations") or []
+                seen = set()
+                current_paths = [p for p in paths if not (p in seen or seen.add(p))]
+                break
+    except Exception as e:
+        print(f"[jellyfin] could not fetch paths for options update: {e}")
+
     body = {
         "Id": lib_id,
         "LibraryOptions": {
             "EnableRealtimeMonitor": True,
             "SaveLocalMetadata": False,
+            "MetadataSavers": [],
             "EnableInternetProviders": True,
+            "PathInfos": [{"Path": p} for p in current_paths],
             "TypeOptions": [
                 {
                     "Type": "Series",
@@ -478,6 +528,25 @@ def ensure_user_library(user_id, username):
     safe_name = safe_username(username)
     lib_name = f"{YT_LIB_PREFIX}{safe_name}"
     user_shows = f"{MEDIA_ROOT}/{safe_name}/shows"
+
+    # Before creating, check if a library with this exact name already
+    # exists in Jellyfin. This catches the case where our cached ID is
+    # stale but the library itself is fine, and prevents duplicate
+    # creation (jnra, jnra2, jnra3, ...).
+    if not my_lib_id:
+        existing = next(
+            (l for l in list_jellyfin_libraries() if l["name"] == lib_name),
+            None,
+        )
+        if existing:
+            my_lib_id = existing["id"]
+            with db() as conn:
+                conn.execute(
+                    "UPDATE users SET library_id=? WHERE user_id=?",
+                    (my_lib_id, user_id),
+                )
+            print(f"[jellyfin] recovered existing library by name: "
+                  f"{lib_name} -> {my_lib_id}", flush=True)
 
     if not my_lib_id:
         os.makedirs(user_shows, exist_ok=True)
@@ -1378,6 +1447,35 @@ SETTINGS_PAGE = """
   </form>
 {% endif %}
 
+<div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
+  <label>User maintenance</label>
+  <p class="small">Clear a user's download archive to force yt-dlp to re-download their library. Useful after data loss or for a full rebuild.</p>
+
+  {% for u in user_list %}
+  <div style="background:#f7f9fb;border:1px solid #e1e6eb;border-radius:6px;padding:12px 16px;margin:10px 0">
+    <strong>{{ u.username }}</strong>
+    <span class="small" style="margin-left:8px">
+      — {{ u.sources }} sources, {{ u.archive_count }} archived videos
+    </span>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button type="button" class="admin-archive-btn" data-uid="{{ u.user_id }}" data-action="clear"
+              style="background:#c33;padding:8px 14px;font-size:14px">
+        Clear Archive
+      </button>
+      <button type="button" class="admin-archive-btn" data-uid="{{ u.user_id }}" data-action="clear-retrigger"
+              style="background:#00a4dc;padding:8px 14px;font-size:14px">
+        Clear + Rescan
+      </button>
+      <button type="button" class="admin-archive-btn" data-uid="{{ u.user_id }}" data-action="retrigger"
+              style="background:#888;padding:8px 14px;font-size:14px">
+        Just Rescan
+      </button>
+    </div>
+    <div class="admin-archive-status" data-uid="{{ u.user_id }}" style="margin-top:8px;font-size:13px"></div>
+  </div>
+  {% endfor %}
+</div>
+
 <div class="field-group" style="margin-top:24px">
   <label>YouTube cookies.txt (optional)</label>
   <p class="small">Used by yt-dlp for age-restricted or members-only content. Upload a fresh export from a browser extension like "Get cookies.txt LOCALLY".</p>
@@ -1443,6 +1541,44 @@ SETTINGS_PAGE = """
       });
   }
 })();
+
+// Admin archive controls
+document.querySelectorAll('.admin-archive-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const uid = btn.dataset.uid;
+    const action = btn.dataset.action;
+    const status = document.querySelector(`.admin-archive-status[data-uid="${uid}"]`);
+
+    if (!confirm('This will affect all downloads for this user. Continue?')) return;
+
+    status.style.color = '#666';
+    status.textContent = 'Working…';
+    btn.disabled = true;
+
+    try {
+      let msg = '';
+      if (action === 'clear' || action === 'clear-retrigger') {
+        const r1 = await fetch(`/admin/clear-archive/${uid}`, { method: 'POST' });
+        const d1 = await r1.json();
+        msg = d1.message || 'Cleared.';
+        if (!d1.ok) throw new Error(msg);
+      }
+      if (action === 'retrigger' || action === 'clear-retrigger') {
+        const r2 = await fetch(`/admin/retrigger/${uid}`, { method: 'POST' });
+        const d2 = await r2.json();
+        msg += ' ' + (d2.message || 'Queued.');
+        if (!d2.ok) throw new Error(msg);
+      }
+      status.style.color = '#0a5';
+      status.textContent = msg;
+    } catch (e) {
+      status.style.color = '#c00';
+      status.textContent = 'Error: ' + e.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+});
 </script>
 
 <p class="small"><a href="/">← Back to dashboard</a></p>
@@ -1767,6 +1903,49 @@ def upload_cookies():
     return {"ok": True, "message": f"Saved cookies.txt ({len(raw)} bytes)."}
 
 
+@app.route("/admin/clear-archive/<user_id>", methods=["POST"])
+def clear_archive(user_id):
+    """Delete the download archive for a user so yt-dlp re-downloads everything."""
+    if "user_id" not in session or not session.get("is_admin"):
+        return {"ok": False, "message": "Admin only."}, 403
+    if not session.get("settings_unlocked"):
+        return {"ok": False, "message": "Unlock settings first."}, 403
+
+    archive = f"/app-data/{user_id}/archive.txt"
+    count = 0
+    if os.path.exists(archive):
+        with open(archive) as f:
+            count = sum(1 for line in f if line.strip())
+        os.remove(archive)
+        print(f"[admin] cleared archive for {user_id} ({count} entries)", flush=True)
+
+    return {"ok": True, "message": f"Cleared {count} entries from archive."}, 200
+
+
+@app.route("/admin/retrigger/<user_id>", methods=["POST"])
+def retrigger_user(user_id):
+    """Re-run every source for a user in the background."""
+    if "user_id" not in session or not session.get("is_admin"):
+        return {"ok": False, "message": "Admin only."}, 403
+    if not session.get("settings_unlocked"):
+        return {"ok": False, "message": "Unlock settings first."}, 403
+
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sources WHERE user_id=?", (user_id,)
+        ).fetchall()
+
+    for row in rows:
+        threading.Thread(
+            target=run_download,
+            args=(row["user_id"], row["url"], row["name"], row["cutoff"]),
+            daemon=True,
+        ).start()
+
+    print(f"[admin] retriggered {len(rows)} sources for {user_id}", flush=True)
+    return {"ok": True, "message": f"Queued {len(rows)} sources for rescan."}, 200
+
+
 @app.route("/settings", methods=["GET", "POST"])
 def settings():
     if "user_id" not in session:
@@ -1784,6 +1963,7 @@ def settings():
                 SETTINGS_PAGE, css=BASE_CSS, locked=True,
                 error="That key doesn't match.",
                 jf_url=jellyfin_url(), api_key="",
+                user_list=[],
                 max_lookback=max_lookback_days(),
                 max_retention=max_retention_days(),
                 playlist_end=playlist_end(),
@@ -1824,6 +2004,7 @@ def settings():
         return render_template_string(
             SETTINGS_PAGE, css=BASE_CSS, locked=False,
             jf_url=jellyfin_url(), api_key=jellyfin_api_key(),
+            user_list=build_user_list(),
             max_lookback=max_lookback_days(),
             max_retention=max_retention_days(),
             playlist_end=playlist_end(),
@@ -1844,6 +2025,7 @@ def settings():
         SETTINGS_PAGE, css=BASE_CSS, locked=locked,
         jf_url=jellyfin_url(),
         api_key=jellyfin_api_key() if not locked else "",
+        user_list=build_user_list() if not locked else [],
         max_lookback=max_lookback_days(),
         max_retention=max_retention_days(),
         playlist_end=playlist_end(),
