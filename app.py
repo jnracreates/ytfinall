@@ -296,7 +296,7 @@ def _create_jellyfin_library(lib_name, path):
     body = {
         "LibraryOptions": {
             "EnableRealtimeMonitor": True,
-            "SaveLocalMetadata": True,
+            "SaveLocalMetadata": False,
             "EnableInternetProviders": True,
             "TypeOptions": [
                 {
@@ -389,7 +389,7 @@ def _update_jellyfin_library_options(lib_id, lib_name):
         "Id": lib_id,
         "LibraryOptions": {
             "EnableRealtimeMonitor": True,
-            "SaveLocalMetadata": True,
+            "SaveLocalMetadata": False,
             "EnableInternetProviders": True,
             "TypeOptions": [
                 {
