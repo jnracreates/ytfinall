@@ -668,8 +668,8 @@ def build_ytdlp_cmd(user_id, url, custom_name=None, cutoff_date=None):
         "--ignore-errors",
     ]
     if not is_single_video:
-        cmd += ["--match-filter", "aspect_ratio>=1"]
-        cmd += ["--dateafter", dateafter]
+        cmd += ["--match-filter", f"upload_date >= {dateafter} & aspect_ratio>=1"]
+        cmd += ["--break-on-reject"]
 
     cmd += extra_ytdlp_args()
     cmd += ["-o", outtmpl]
@@ -778,6 +778,9 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
             print(f"[download] move error: {e}", flush=True)
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
+
+        # Remove empty season folders left behind by yt-dlp's NFO generation
+        cleanup_empty_folders(final_root)
     else:
         print(f"[download] failed, staging kept at {staging_dir}", flush=True)
 
