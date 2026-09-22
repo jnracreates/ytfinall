@@ -818,10 +818,12 @@ def write_episode_nfo_from_json(info_json_path, max_paragraphs=2):
         # If half or more of the lines are URLs, it's a link dump
         if url_lines / len(lines) >= 0.5:
             return True
-        # Also catch paragraphs where the majority of characters are URLs
-        url_chars = sum(len(ln) for ln in lines if ln.startswith("http") or ln.startswith("www."))
-        total_chars = sum(len(ln) for ln in lines)
-        if total_chars > 0 and url_chars / total_chars >= 0.5:
+        # Also catch paragraphs where the majority of characters are URLs.
+        # Use regex to find URLs anywhere in the paragraph, not just at
+        # the start of lines, so "Get X here: https://..." is caught.
+        url_chars = sum(len(m) for m in re.findall(r"https?://\S+|www\.\S+", stripped))
+        total_chars = len(stripped)
+        if total_chars > 0 and url_chars / total_chars >= 0.4:
             return True
         # Paragraph with just a few hashtags
         if stripped.startswith("#") and len(stripped) < 200:
@@ -839,6 +841,13 @@ def write_episode_nfo_from_json(info_json_path, max_paragraphs=2):
             "comment below",
             "see you next time",
             "stay tuned",
+            "want to support me",
+            "want to support the",
+            "support me and the channel",
+            "support the channel",
+            "follow me on",
+            "check out my",
+            "join my",
         ]
         # Only filter short paragraphs (< 200 chars) that contain an outro phrase.
         # Longer paragraphs might have real content mixed in.
@@ -861,6 +870,46 @@ def write_episode_nfo_from_json(info_json_path, max_paragraphs=2):
         description = "\n\n".join(filtered[:max_paragraphs])
     elif filtered:
         description = "\n\n".join(filtered)
+    else:
+        description = ""
+
+    # If the surviving description is still URL-heavy, drop it entirely.
+    # This handles sponsored-link-only descriptions where the sponsor
+    # pitch is the "content."
+    if description:
+        total = len(description)
+        url_chars = sum(len(m) for m in re.findall(r"https?://\S+", description))
+        if total > 0 and url_chars / total > 0.25:
+            description = ""
+        # Also drop descriptions that contain sponsor signals but no
+        # real content — no sentence longer than 20 chars that isn't
+        # a promo phrase.
+        if description:
+            lowered = description.lower()
+            sponsor_signals = [
+                "use code",
+                "at checkout",
+                "sponsored by",
+                "get x% off",
+                "discount code",
+                "promo code",
+                "buy here",
+                "get it here",
+                "affiliate",
+                "sponsor",
+            ]
+            if any(sig in lowered for sig in sponsor_signals):
+                # Check if there's any "real" content — a sentence with
+                # >30 chars that doesn't contain a sponsor signal
+                sentences = re.split(r"[.!?]\s", description)
+                has_real = False
+                for s in sentences:
+                    s_low = s.lower()
+                    if len(s) > 30 and not any(sig in s_low for sig in sponsor_signals):
+                        has_real = True
+                        break
+                if not has_real:
+                    description = ""
 
     # --- Format the air date as YYYY-MM-DD ---
     aired = ""
