@@ -30,6 +30,71 @@ def apply_animated_library_cover(user_media_folder):
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+
+# ------------------------------------------------------------------
+# In-memory log buffer for the admin live-logs panel
+# ------------------------------------------------------------------
+import sys as _sys
+import threading as _threading
+from collections import deque as _deque
+
+_log_buffer = _deque(maxlen=500)
+_log_lock = _threading.Lock()
+
+
+class _TeeStdout:
+    """Write to the real stdout AND append complete lines to the ring buffer.
+
+    print() calls write() twice: once with the text (no newline) and once
+    with just the newline. We accumulate partial writes until a newline
+    arrives, then emit the complete line.
+    """
+    def __init__(self, original):
+        self.original = original
+        self._pending = ""
+
+    def write(self, data):
+        if not data:
+            return
+        text = data.decode("utf-8", errors="replace") if isinstance(data, (bytes, bytearray)) else data
+        try:
+            self.original.write(data)
+        except Exception:
+            pass
+        combined = self._pending + text
+        if "\n" not in combined:
+            self._pending = combined
+            return
+        *complete, self._pending = combined.split("\n")
+        with _log_lock:
+            for line in complete:
+                line = line.rstrip()
+                if not line.strip():
+                    continue
+                if "/admin/logs" in line:
+                    continue
+                _log_buffer.append(line)
+
+    def flush(self):
+        # Emit any dangling partial line so it isn't lost on shutdown
+        if self._pending.strip():
+            with _log_lock:
+                _log_buffer.append(self._pending)
+            self._pending = ""
+        try:
+            self.original.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return False
+
+
+if not isinstance(_sys.stdout, _TeeStdout):
+    _sys.stdout = _TeeStdout(_sys.stdout)
+if not isinstance(_sys.stderr, _TeeStdout):
+    _sys.stderr = _TeeStdout(_sys.stderr)
+
 MEDIA_ROOT = "/media/users"
 STAGING_ROOT = "/app-data/staging"
 CONFIG_DIR = "/config"
@@ -1855,6 +1920,15 @@ SETTINGS_PAGE = """
   {% endfor %}
 </div>
 
+<div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
+  <label>Live logs</label>
+  <p class="small">Updates every 2 seconds while this tab is visible. Shows the last 500 lines.</p>
+  <div id="log-box" style="background:#111;color:#0f0;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:12px;padding:12px;border-radius:6px;height:320px;overflow-y:auto;white-space:pre-wrap;line-height:1.35;word-break:break-all">Loading…</div>
+  <div style="margin-top:8px">
+    <button type="button" id="log-clear" style="background:#555;padding:6px 12px;font-size:13px">Clear buffer</button>
+  </div>
+</div>
+
 <div class="field-group" style="margin-top:24px">
   <label>YouTube cookies.txt (optional)</label>
   <p class="small">Used by yt-dlp for age-restricted or members-only content. Upload a fresh export from a browser extension like "Get cookies.txt LOCALLY".</p>
@@ -1918,6 +1992,69 @@ SETTINGS_PAGE = """
         status.style.color = '#c00';
         status.textContent = 'Upload failed: ' + err;
       });
+  }
+})();
+
+// Live log polling — only while the tab is visible
+(function () {
+  const box = document.getElementById('log-box');
+  if (!box) return;
+  let pinnedToBottom = true;
+  let pollTimer = null;
+
+  box.addEventListener('scroll', () => {
+    const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+    pinnedToBottom = atBottom;
+  });
+
+  async function poll() {
+    try {
+      const r = await fetch('/admin/logs');
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!Array.isArray(d.lines)) return;
+      const text = d.lines.join('\\n');
+      if (box.dataset.last === text) return;
+      box.dataset.last = text;
+      box.textContent = text;
+      if (pinnedToBottom) {
+        box.scrollTop = box.scrollHeight;
+      }
+    } catch (_) {}
+  }
+
+  function startPolling() {
+    if (pollTimer !== null) return;
+    poll();
+    pollTimer = setInterval(poll, 2000);
+  }
+
+  function stopPolling() {
+    if (pollTimer === null) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stopPolling();
+    } else {
+      startPolling();
+    }
+  });
+
+  // Start only if the tab is currently visible
+  if (!document.hidden) {
+    startPolling();
+  }
+
+  const clearBtn = document.getElementById('log-clear');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', async () => {
+      await fetch('/admin/logs/clear', { method: 'POST' });
+      box.dataset.last = '';
+      box.textContent = '(cleared)';
+    });
   }
 })();
 
@@ -2282,6 +2419,64 @@ def upload_cookies():
     return {"ok": True, "message": f"Saved cookies.txt ({len(raw)} bytes)."}
 
 
+@app.route("/admin/logs/clear", methods=["POST"])
+def admin_logs_clear():
+    if "user_id" not in session or not session.get("is_admin"):
+        return {"ok": False}, 403
+    if not session.get("settings_unlocked"):
+        return {"ok": False}, 403
+    with _log_lock:
+        _log_buffer.clear()
+    return {"ok": True}, 200
+
+
+@app.route("/admin/logs/debug")
+def admin_logs_debug():
+    import sys
+    return {
+        "stdout_class": type(sys.stdout).__name__,
+        "stdout_id": id(sys.stdout),
+        "buffer_len": len(_log_buffer),
+        "buffer_sample": list(_log_buffer)[-3:],
+    }, 200
+
+
+@app.route("/admin/logs/test")
+def admin_logs_test():
+    import sys
+    before = len(_log_buffer)
+    buf_id = id(_log_buffer)
+    stdout_id = id(sys.stdout)
+    # Direct write to test the Tee
+    sys.stdout.write("[test] direct stdout write\n")
+    sys.stdout.flush()
+    after_write = len(_log_buffer)
+    # Now via print()
+    print("[test] via print()", flush=True)
+    after_print = len(_log_buffer)
+    return {
+        "buffer_id": buf_id,
+        "stdout_id": stdout_id,
+        "stdout_class": type(sys.stdout).__name__,
+        "len_before": before,
+        "len_after_write": after_write,
+        "len_after_print": after_print,
+        "buffer_tail": list(_log_buffer)[-5:],
+    }, 200
+
+
+@app.route("/admin/logs")
+def admin_logs():
+    """Return the last N buffered log lines as JSON."""
+    if "user_id" not in session or not session.get("is_admin"):
+        return {"error": "admin only"}, 403
+    if not session.get("settings_unlocked"):
+        return {"error": "settings locked"}, 403
+    with _log_lock:
+        lines = list(_log_buffer)
+    return {"lines": lines}, 200
+
+
 @app.route("/admin/clear-archive/<user_id>", methods=["POST"])
 def clear_archive(user_id):
     """Delete the download archive for a user so yt-dlp re-downloads everything."""
@@ -2526,4 +2721,9 @@ def api_download():
 
 
 if __name__ == "__main__":
+    import logging
+    # Silence Werkzeug's per-request access log so `docker logs` stays
+    # readable. Errors and warnings still print.
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
     app.run(host="0.0.0.0", port=6842)
