@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .env
 config/cookies.txt.bak
+archive-before-loss*.txt

@@ -175,7 +175,7 @@ def outtmpl_setting():
         "outtmpl",
         "%(channel)s [%(channel_id)s]/"
         "Season %(upload_date>%Y)s/"
-        "%(channel)s - %(upload_date>%Y.%m.%d)s - %(title)s [%(id)s].%(ext)s",
+        "%(channel)s - s%(upload_date>%Y)se%(upload_date>%m%d)s - %(title)s [%(id)s].%(ext)s",
     )
 
 
@@ -327,34 +327,37 @@ def _create_jellyfin_library(lib_name, path):
             "EnableRealtimeMonitor": True,
             "SaveLocalMetadata": False,
             "MetadataSavers": [],
-            "EnableInternetProviders": True,
+            "LocalMetadataReaderOrder": ["Nfo"],
+            "DisabledLocalMetadataReaders": ["YoutubeMetadata"],
+            "EnableInternetProviders": False,
+            "EnableAutomaticSeriesGrouping": False,
             "PathInfos": [{"Path": path}],
             "TypeOptions": [
                 {
                     "Type": "Series",
-                    "MetadataFetchers": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
-                    "MetadataFetcherOrder": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetcherOrder": ["TheMovieDb", "The Open Movie Database"],
                     "DisabledMetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
-                    "ImageFetchers": ["YoutubeMetadata", "TheMovieDb"],
-                    "ImageFetcherOrder": ["YoutubeMetadata", "TheMovieDb"],
+                    "ImageFetchers": ["TheMovieDb"],
+                    "ImageFetcherOrder": ["TheMovieDb"],
                     "DisabledImageFetchers": ["TheMovieDb"],
                 },
                 {
                     "Type": "Season",
-                    "MetadataFetchers": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
-                    "MetadataFetcherOrder": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetcherOrder": ["TheMovieDb", "The Open Movie Database"],
                     "DisabledMetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
-                    "ImageFetchers": ["YoutubeMetadata", "TheMovieDb"],
-                    "ImageFetcherOrder": ["YoutubeMetadata", "TheMovieDb"],
+                    "ImageFetchers": ["TheMovieDb"],
+                    "ImageFetcherOrder": ["TheMovieDb"],
                     "DisabledImageFetchers": ["TheMovieDb"],
                 },
                 {
                     "Type": "Episode",
-                    "MetadataFetchers": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
-                    "MetadataFetcherOrder": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetcherOrder": ["TheMovieDb", "The Open Movie Database"],
                     "DisabledMetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
-                    "ImageFetchers": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database", "Embedded Image Extractor", "Screen Grabber"],
-                    "ImageFetcherOrder": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database", "Embedded Image Extractor", "Screen Grabber"],
+                    "ImageFetchers": ["TheMovieDb", "The Open Movie Database", "Embedded Image Extractor", "Screen Grabber"],
+                    "ImageFetcherOrder": ["TheMovieDb", "The Open Movie Database", "Embedded Image Extractor", "Screen Grabber"],
                     "DisabledImageFetchers": ["TheMovieDb", "The Open Movie Database"],
                 },
             ],
@@ -439,34 +442,37 @@ def _update_jellyfin_library_options(lib_id, lib_name):
             "EnableRealtimeMonitor": True,
             "SaveLocalMetadata": False,
             "MetadataSavers": [],
-            "EnableInternetProviders": True,
+            "LocalMetadataReaderOrder": ["Nfo"],
+            "DisabledLocalMetadataReaders": ["YoutubeMetadata"],
+            "EnableInternetProviders": False,
+            "EnableAutomaticSeriesGrouping": False,
             "PathInfos": [{"Path": p} for p in current_paths],
             "TypeOptions": [
                 {
                     "Type": "Series",
-                    "MetadataFetchers": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
-                    "MetadataFetcherOrder": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetcherOrder": ["TheMovieDb", "The Open Movie Database"],
                     "DisabledMetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
-                    "ImageFetchers": ["YoutubeMetadata", "TheMovieDb"],
-                    "ImageFetcherOrder": ["YoutubeMetadata", "TheMovieDb"],
+                    "ImageFetchers": ["TheMovieDb"],
+                    "ImageFetcherOrder": ["TheMovieDb"],
                     "DisabledImageFetchers": ["TheMovieDb"],
                 },
                 {
                     "Type": "Season",
-                    "MetadataFetchers": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
-                    "MetadataFetcherOrder": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetcherOrder": ["TheMovieDb", "The Open Movie Database"],
                     "DisabledMetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
-                    "ImageFetchers": ["YoutubeMetadata", "TheMovieDb"],
-                    "ImageFetcherOrder": ["YoutubeMetadata", "TheMovieDb"],
+                    "ImageFetchers": ["TheMovieDb"],
+                    "ImageFetcherOrder": ["TheMovieDb"],
                     "DisabledImageFetchers": ["TheMovieDb"],
                 },
                 {
                     "Type": "Episode",
-                    "MetadataFetchers": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
-                    "MetadataFetcherOrder": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
+                    "MetadataFetcherOrder": ["TheMovieDb", "The Open Movie Database"],
                     "DisabledMetadataFetchers": ["TheMovieDb", "The Open Movie Database"],
-                    "ImageFetchers": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database", "Embedded Image Extractor", "Screen Grabber"],
-                    "ImageFetcherOrder": ["YoutubeMetadata", "TheMovieDb", "The Open Movie Database", "Embedded Image Extractor", "Screen Grabber"],
+                    "ImageFetchers": ["TheMovieDb", "The Open Movie Database", "Embedded Image Extractor", "Screen Grabber"],
+                    "ImageFetcherOrder": ["TheMovieDb", "The Open Movie Database", "Embedded Image Extractor", "Screen Grabber"],
                     "DisabledImageFetchers": ["TheMovieDb", "The Open Movie Database"],
                 },
             ],
@@ -708,7 +714,7 @@ def build_ytdlp_cmd(user_id, url, custom_name=None, cutoff_date=None):
             f"{staging_dir}/"
             "One-Off Videos/"
             "Season %(upload_date>%Y)s/"
-            "One-Off Videos - %(upload_date>%Y.%m.%d)s - %(title)s [%(id)s].%(ext)s"
+            "One-Off Videos - s%(upload_date>%Y)se%(upload_date>%m%d)s - %(title)s [%(id)s].%(ext)s"
         )
     else:
         outtmpl = f"{staging_dir}/{outtmpl_setting()}"
@@ -873,18 +879,33 @@ def _has_media_file(folder):
 
 
 def cleanup_empty_folders(user_root):
-    """Remove folders that contain no media files (nfo/json don't count)."""
+    """Remove folders that contain no media files (nfo/json don't count).
+
+    Only removes folders that have been empty for at least 24 hours, to
+    avoid deleting folders during the brief window when a file is being
+    moved or renamed.
+    """
     if not os.path.isdir(user_root):
         return
+    now = time.time()
+    one_day = 86400
     for root, dirs, _ in os.walk(user_root, topdown=False):
         for d in dirs:
             path = os.path.join(root, d)
-            if not _has_media_file(path):
-                try:
-                    shutil.rmtree(path)
-                    print(f"[cleanup] removed empty folder: {path}", flush=True)
-                except OSError as e:
-                    print(f"[cleanup] could not remove {path}: {e}", flush=True)
+            if _has_media_file(path):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if now - mtime < one_day:
+                print(f"[cleanup] skipping recent folder: {path}", flush=True)
+                continue
+            try:
+                shutil.rmtree(path)
+                print(f"[cleanup] removed empty folder: {path}", flush=True)
+            except OSError as e:
+                print(f"[cleanup] could not remove {path}: {e}", flush=True)
 
 
 def cleanup_user_media(user_id, retention_days):

@@ -1,0 +1,32 @@
+# Runtime data — never send to build daemon
+app-data/
+config/
+staging/
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+
+# Local environment
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Git and Docker metadata
+.git/
+.github/
+.gitignore
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Logs and temp
+*.log
+*.tmp
+
+# OS cruft
+.DS_Store
+Thumbs.db
