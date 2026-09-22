@@ -772,6 +772,152 @@ def _merge_move(src, dst):
             shutil.move(s, d)
 
 
+def write_episode_nfo_from_json(info_json_path, max_paragraphs=2):
+    """
+    Read a yt-dlp .info.json file and write a sibling .nfo that Jellyfin
+    can parse. Trims the description to max_paragraphs for readability.
+    """
+    import json
+
+    try:
+        with open(info_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"[nfo] could not read {info_json_path}: {e}", flush=True)
+        return
+
+    # Derive the .nfo path from the .info.json path
+    nfo_path = info_json_path[:-len(".info.json")] + ".nfo"
+
+    # Skip if NFO already exists
+    if os.path.exists(nfo_path):
+        return
+
+    # --- Pull the fields we care about ---
+    title = data.get("title") or ""
+    description = data.get("description") or ""
+    upload_date = data.get("upload_date") or ""  # YYYYMMDD
+    channel = data.get("channel") or data.get("uploader") or ""
+    channel_id = data.get("channel_id") or data.get("uploader_id") or ""
+    video_id = data.get("id") or ""
+    thumbnail = data.get("thumbnail") or ""
+    duration = data.get("duration") or 0
+
+    # --- Trim the description to N paragraphs ---
+    parts = re.split(r"\n\s*\n", description.strip())
+    # Drop paragraphs that are mostly URLs or promo (link dumps, hashtags, etc.)
+    def is_link_dump(p):
+        stripped = p.strip()
+        if not stripped:
+            return True
+        # Count lines that are just a URL
+        lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+        if not lines:
+            return True
+        url_lines = sum(1 for ln in lines if ln.startswith("http") or ln.startswith("www."))
+        # If half or more of the lines are URLs, it's a link dump
+        if url_lines / len(lines) >= 0.5:
+            return True
+        # Also catch paragraphs where the majority of characters are URLs
+        url_chars = sum(len(ln) for ln in lines if ln.startswith("http") or ln.startswith("www."))
+        total_chars = sum(len(ln) for ln in lines)
+        if total_chars > 0 and url_chars / total_chars >= 0.5:
+            return True
+        # Paragraph with just a few hashtags
+        if stripped.startswith("#") and len(stripped) < 200:
+            return True
+        # Filter common YouTube outro phrases
+        lowered = stripped.lower()
+        outro_phrases = [
+            "thanks for watching",
+            "thanks for watchin",
+            "thank you for watching",
+            "subscribe",
+            "like and subscribe",
+            "hit the bell",
+            "leave a like",
+            "comment below",
+            "see you next time",
+            "stay tuned",
+        ]
+        # Only filter short paragraphs (< 200 chars) that contain an outro phrase.
+        # Longer paragraphs might have real content mixed in.
+        if len(stripped) < 200:
+            for phrase in outro_phrases:
+                if phrase in lowered:
+                    return True
+        # Multi-line paragraph where most lines contain a URL is a link list.
+        if len(lines) >= 3:
+            url_containing_lines = sum(
+                1 for ln in lines
+                if "http://" in ln or "https://" in ln or "www." in ln
+            )
+            if url_containing_lines / len(lines) >= 0.5:
+                return True
+        return False
+
+    filtered = [p for p in parts if not is_link_dump(p)]
+    if len(filtered) > max_paragraphs:
+        description = "\n\n".join(filtered[:max_paragraphs])
+    elif filtered:
+        description = "\n\n".join(filtered)
+
+    # --- Format the air date as YYYY-MM-DD ---
+    aired = ""
+    if len(upload_date) == 8:
+        aired = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+
+    # --- Season number = upload year ---
+    season = upload_date[:4] if len(upload_date) >= 4 else ""
+
+    # --- Escape XML-sensitive characters in text fields ---
+    def esc(s):
+        return (s.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;")
+                 .replace('"', "&quot;"))
+
+    lines = ['<?xml version="1.0" encoding="utf-8" standalone="yes"?>',
+             "<episodedetails>"]
+    if title:
+        lines.append(f"  <title>{esc(title)}</title>")
+    if description:
+        lines.append(f"  <plot>{esc(description)}</plot>")
+    if season:
+        lines.append(f"  <season>{season}</season>")
+    if aired:
+        lines.append(f"  <aired>{aired}</aired>")
+    if channel:
+        lines.append(f"  <studio>{esc(channel)}</studio>")
+    if video_id:
+        lines.append(f"  <uniqueid type=\"youtube\">{video_id}</uniqueid>")
+    if duration:
+        lines.append(f"  <runtime>{int(duration) // 60}</runtime>")
+    if thumbnail:
+        lines.append(f"  <thumb>{esc(thumbnail)}</thumb>")
+    lines.append("</episodedetails>")
+
+    try:
+        with open(nfo_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"[nfo] wrote episode nfo: {os.path.basename(nfo_path)}", flush=True)
+    except OSError as e:
+        print(f"[nfo] could not write {nfo_path}: {e}", flush=True)
+
+
+def write_all_episode_nfos(directory, max_paragraphs=2):
+    """Walk a directory and write NFOs for every .info.json found."""
+    count = 0
+    for root, _, files in os.walk(directory):
+        for name in files:
+            if name.endswith(".info.json"):
+                write_episode_nfo_from_json(
+                    os.path.join(root, name), max_paragraphs
+                )
+                count += 1
+    return count
+
+
 def fix_one_off_nfo(staging_dir):
     """Rewrite <season>1</season> to <season>YYYY</season> in one-off NFOs.
 
@@ -804,6 +950,118 @@ def fix_one_off_nfo(staging_dir):
                     print(f"[nfo] fixed season -> {year} in {name}", flush=True)
             except OSError as e:
                 print(f"[nfo] could not rewrite {path}: {e}", flush=True)
+
+
+def trim_nfo_plot(nfo_path, max_paragraphs=2):
+    """
+    Trim the <plot> text inside an NFO to the first N paragraphs.
+    YouTube descriptions are often huge (links, socials, credits).
+    Keeping just the intro paragraphs gives Jellyfin a clean synopsis.
+    """
+    try:
+        with open(nfo_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return
+
+    m = re.search(r"<plot>(.*?)</plot>", content, re.DOTALL)
+    if not m:
+        return
+
+    plot = m.group(1)
+    parts = re.split(r"\n\s*\n", plot.strip())
+    if len(parts) <= max_paragraphs:
+        return
+
+    trimmed = "\n\n".join(parts[:max_paragraphs])
+    new_content = content.replace(m.group(0), f"<plot>{trimmed}</plot>")
+
+    try:
+        with open(nfo_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        print(f"[nfo] trimmed plot in {os.path.basename(nfo_path)}", flush=True)
+    except OSError as e:
+        print(f"[nfo] could not trim {nfo_path}: {e}", flush=True)
+
+
+def trim_all_nfos(directory, max_paragraphs=2):
+    """Walk a directory tree and trim every episode .nfo file."""
+    for root, _, files in os.walk(directory):
+        for name in files:
+            if name.endswith(".nfo") and name not in ("tvshow.nfo", "season.nfo"):
+                trim_nfo_plot(os.path.join(root, name), max_paragraphs)
+
+
+def write_channel_metadata(channel_dir, channel_name, channel_id):
+    """
+    Download the channel avatar as poster.jpg and write a tvshow.nfo
+    with the clean channel name. Both are local; nothing expires.
+    """
+    import subprocess
+
+    nfo_path = os.path.join(channel_dir, "tvshow.nfo")
+    poster_path = os.path.join(channel_dir, "poster.jpg")
+
+    if os.path.exists(nfo_path) and os.path.exists(poster_path):
+        print(f"[nfo] metadata already present for {channel_name}", flush=True)
+        return
+
+    if not os.path.exists(poster_path) and channel_id:
+        avatar_url = None
+        # Scrape the channel page for the avatar URL.
+        # yt-dlp doesn't expose channel avatars in its metadata,
+        # so we grab it directly from the HTML.
+        for page_url in (
+            f"https://www.youtube.com/channel/{channel_id}",
+            f"https://www.youtube.com/channel/{channel_id}/videos",
+        ):
+            try:
+                page = subprocess.run(
+                    ["curl", "-sL", "--max-time", "20", page_url],
+                    capture_output=True, text=True, timeout=25,
+                )
+                if page.returncode != 0:
+                    continue
+                m = re.search(
+                    r'https://yt3\.googleusercontent\.com/[a-zA-Z0-9=_-]+',
+                    page.stdout,
+                )
+                if m:
+                    avatar_url = m.group(0)
+                    break
+            except Exception as e:
+                print(f"[nfo] scrape error for {channel_name}: {e}", flush=True)
+
+        if avatar_url:
+            try:
+                dl = subprocess.run(
+                    ["curl", "-sL", "--max-time", "30", "-o", poster_path, avatar_url],
+                    capture_output=True, timeout=45,
+                )
+                if dl.returncode == 0 and os.path.exists(poster_path) and os.path.getsize(poster_path) > 0:
+                    print(f"[nfo] downloaded avatar for {channel_name}", flush=True)
+                else:
+                    print(f"[nfo] avatar download failed for {channel_name}", flush=True)
+                    if os.path.exists(poster_path) and os.path.getsize(poster_path) == 0:
+                        os.remove(poster_path)
+            except Exception as e:
+                print(f"[nfo] avatar download error for {channel_name}: {e}", flush=True)
+        else:
+            print(f"[nfo] no avatar URL found for {channel_name}", flush=True)
+
+    if not os.path.exists(nfo_path):
+        nfo = [
+            '<?xml version="1.0" encoding="utf-8" standalone="yes"?>',
+            "<tvshow>",
+            f"  <title>{channel_name}</title>",
+            "</tvshow>",
+        ]
+        try:
+            with open(nfo_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(nfo) + "\n")
+            print(f"[nfo] wrote {nfo_path}", flush=True)
+        except OSError as e:
+            print(f"[nfo] could not write {nfo_path}: {e}", flush=True)
 
 
 def run_download(user_id, url, custom_name=None, cutoff_date=None):
@@ -846,6 +1104,7 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
     if success:
         os.makedirs(final_root, exist_ok=True)
         try:
+            write_all_episode_nfos(staging_dir)
             fix_one_off_nfo(staging_dir)
             _merge_move(staging_dir, final_root)
             print(f"[download] moved {staging_dir} -> {final_root}", flush=True)
@@ -853,6 +1112,25 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
             print(f"[download] move error: {e}", flush=True)
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
+
+        # Trim long YouTube descriptions to a short synopsis
+        try:
+            trim_all_nfos(final_root, max_paragraphs=2)
+        except Exception as e:
+            print(f"[nfo] trim error: {e}", flush=True)
+
+        # Ensure channel metadata (poster.jpg + tvshow.nfo) exists
+        try:
+            for entry in os.listdir(final_root):
+                entry_path = os.path.join(final_root, entry)
+                if not os.path.isdir(entry_path) or entry == "One-Off Videos":
+                    continue
+                m = re.match(r"^(.+?)\s*\[([A-Za-z0-9_-]+)\]$", entry)
+                if not m:
+                    continue
+                write_channel_metadata(entry_path, m.group(1).strip(), m.group(2))
+        except Exception as e:
+            print(f"[nfo] channel metadata error: {e}", flush=True)
 
         # Remove empty season folders left behind by yt-dlp's NFO generation
         cleanup_empty_folders(final_root)
