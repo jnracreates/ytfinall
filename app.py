@@ -1350,8 +1350,14 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
 
     if success:
         if downloaded == 0:
-            finish_task(task_id, "complete",
-                        "No new videos — everything is already downloaded.")
+            # Nothing downloaded — remove the task entirely so the user
+            # doesn't see a stale "no-op" entry every scan cycle.
+            try:
+                with db() as conn:
+                    conn.execute("DELETE FROM download_tasks WHERE id=?",
+                                 (task_id,))
+            except Exception:
+                pass
         else:
             finish_task(task_id, "complete",
                         f"Done. {downloaded} video(s) will appear on Jellyfin shortly.")
