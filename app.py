@@ -171,9 +171,79 @@ def init_db():
                 library_id TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS download_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                kind TEXT,
+                status TEXT,
+                progress_pct REAL DEFAULT 0,
+                current_item INTEGER DEFAULT 0,
+                total_items INTEGER DEFAULT 0,
+                downloaded_count INTEGER DEFAULT 0,
+                eta_seconds INTEGER,
+                message TEXT,
+                started_at TEXT,
+                updated_at TEXT,
+                finished_at TEXT
+            )
+        """)
 
 
 init_db()
+
+
+def _now_iso():
+    return datetime.datetime.utcnow().isoformat(timespec="seconds")
+
+
+def create_task(user_id, url, kind):
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO download_tasks "
+            "(user_id, url, kind, status, started_at, updated_at, message) "
+            "VALUES (?, ?, ?, 'queued', ?, ?, ?)",
+            (user_id, url, kind, _now_iso(), _now_iso(), "Queued"),
+        )
+        return cur.lastrowid
+
+
+def update_task(task_id, **fields):
+    if not fields:
+        return
+    fields["updated_at"] = _now_iso()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [task_id]
+    with db() as conn:
+        conn.execute(f"UPDATE download_tasks SET {cols} WHERE id=?", vals)
+
+
+def finish_task(task_id, status, message):
+    update_task(task_id, status=status, message=message,
+                finished_at=_now_iso())
+
+
+def get_user_tasks(user_id, limit=5):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM download_tasks WHERE user_id=? "
+            "ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def purge_old_tasks(user_id, age_seconds=600):
+    cutoff = (datetime.datetime.utcnow()
+              - datetime.timedelta(seconds=age_seconds)
+              ).isoformat(timespec="seconds")
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM download_tasks "
+            "WHERE user_id=? AND finished_at IS NOT NULL AND finished_at < ?",
+            (user_id, cutoff),
+        )
 
 
 def get_config(key, default=None):
@@ -1198,6 +1268,26 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
     cmd, staging_dir = build_ytdlp_cmd(user_id, url, custom_name, cutoff_date)
     print(f"[download] starting {url} for user {user_id}", flush=True)
 
+    # Create a task row so the dashboard can show progress
+    try:
+        purge_old_tasks(user_id, age_seconds=600)
+    except Exception:
+        pass
+    is_channel = not (
+        ("youtube.com/watch" in url or "youtu.be/" in url)
+        and "/playlist" not in url
+    )
+    kind = "channel" if is_channel else "video"
+    task_id = create_task(user_id, url, kind)
+
+    item_re = re.compile(r"\[download\]\s+Downloading item (\d+) of (\d+)")
+    dest_re = re.compile(r"\[download\]\s+Destination:")
+    already_re = re.compile(r"already been recorded in the archive")
+    pct_re = re.compile(r"\[download\]\s+([\d.]+)%\s+of\s+~?\s*[\d.]+\w+")
+    eta_re = re.compile(r"ETA\s+([\d:]+)")
+
+    downloaded = 0
+
     success = False
     try:
         proc = subprocess.Popen(
@@ -1209,13 +1299,65 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
         )
         for line in proc.stdout:
             print(f"[yt-dlp] {line.rstrip()}", flush=True)
+            stripped = line.rstrip()
+
+            m = item_re.search(stripped)
+            if m:
+                cur, total = int(m.group(1)), int(m.group(2))
+                update_task(task_id,
+                            status="scanning",
+                            current_item=cur,
+                            total_items=total,
+                            message=f"Scanning {cur} of {total}")
+                continue
+
+            if dest_re.search(stripped):
+                downloaded += 1
+                update_task(task_id,
+                            status="downloading",
+                            downloaded_count=downloaded,
+                            progress_pct=0,
+                            eta_seconds=None,
+                            message=f"Downloading #{downloaded}")
+                continue
+
+            if already_re.search(stripped):
+                update_task(task_id, message="Skipped (already have it)")
+                continue
+
+            m = pct_re.search(stripped)
+            if m:
+                pct = float(m.group(1))
+                eta_s = None
+                em = eta_re.search(stripped)
+                if em:
+                    parts = [int(x) for x in em.group(1).split(":") if x.isdigit()]
+                    if len(parts) == 2:
+                        eta_s = parts[0] * 60 + parts[1]
+                    elif len(parts) == 3:
+                        eta_s = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                update_task(task_id,
+                            progress_pct=pct,
+                            eta_seconds=eta_s)
+                continue
+
         proc.wait(timeout=7200)
         print(f"[download] exit code {proc.returncode}", flush=True)
-        # Note: 101 is yt-dlp's success code for cleanly breaking early on an existing file!
         if proc.returncode in (0, 1, 101):
             success = True
     except Exception as e:
         print(f"[download] error: {e}", flush=True)
+
+    if success:
+        if downloaded == 0:
+            finish_task(task_id, "complete",
+                        "No new videos — everything is already downloaded.")
+        else:
+            finish_task(task_id, "complete",
+                        f"Done. {downloaded} video(s) will appear on Jellyfin shortly.")
+    else:
+        finish_task(task_id, "failed",
+                    "Download failed. Check the admin logs for details.")
 
     with db() as conn:
         row = conn.execute(
@@ -1554,6 +1696,25 @@ DASHBOARD = """
 keep media up to <strong>{{ max_retention }}</strong> days.</p>
 </div>
 
+<div id="tasks-container" style="display:none;margin:18px 0">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h3 style="margin:0">Active downloads</h3>
+    <button type="button" id="tasks-clear" style="background:#888;padding:6px 12px;font-size:13px">Clear finished</button>
+  </div>
+  <div id="tasks-list"></div>
+</div>
+
+<style>
+  .task { background: #f7f9fb; border: 1px solid #e1e6eb; border-radius: 6px; padding: 12px 16px; margin: 10px 0; }
+  .task-url { font-size: 12px; color: #666; word-break: break-all; margin-bottom: 6px; }
+  .task-msg { font-size: 13px; color: #333; margin-bottom: 6px; }
+  .task-bar { background: #e1e6eb; height: 18px; border-radius: 4px; overflow: hidden; }
+  .task-fill { background: #00a4dc; height: 100%; width: 0%; transition: width 0.3s ease; }
+  .task.complete .task-fill { background: #0a5; }
+  .task.failed .task-fill { background: #c33; }
+  .task-eta { font-size: 12px; color: #666; margin-top: 4px; }
+</style>
+
 <h3>Add a one-off video</h3>
 <form method="post" action="/add">
   <div class="field-group">
@@ -1670,6 +1831,101 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 {% endfor %}
 </table>
 </div>
+
+<script>
+(function () {
+  const container = document.getElementById('tasks-container');
+  const list = document.getElementById('tasks-list');
+  if (!container || !list) return;
+
+  function esc(s) {
+    return String(s || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+  }
+
+  function fmtTime(sec) {
+    if (sec == null) return '';
+    sec = Math.max(0, Math.round(sec));
+    if (sec < 60) return sec + 's';
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return m + 'm ' + s + 's';
+  }
+
+  function render(tasks) {
+    if (!tasks.length) {
+      container.style.display = 'none';
+      list.innerHTML = '';
+      return;
+    }
+    container.style.display = 'block';
+    list.innerHTML = '';
+    for (const t of tasks) {
+      const div = document.createElement('div');
+      div.className = 'task ' + (t.status || '');
+      const pct = (t.status === 'complete') ? 100 : (t.progress_pct || 0);
+
+      let eta = '';
+      if (t.status === 'downloading' && t.eta_seconds != null) {
+        eta = 'ETA ' + fmtTime(t.eta_seconds) + ' remaining';
+      } else if (t.status === 'scanning' && t.total_items) {
+        eta = 'Checking video ' + t.current_item + ' of ' + t.total_items;
+      } else if (t.status === 'complete') {
+        eta = t.message || 'Done.';
+      } else if (t.status === 'failed') {
+        eta = t.message || 'Failed.';
+      } else if (t.message) {
+        eta = t.message;
+      }
+
+      div.innerHTML =
+        '<div class="task-url">' + esc(t.url) + '</div>' +
+        '<div class="task-msg">' + esc(t.message || t.status || '') + '</div>' +
+        '<div class="task-bar"><div class="task-fill" style="width:' + pct + '%"></div></div>' +
+        '<div class="task-eta">' + esc(eta) + '</div>';
+      list.appendChild(div);
+    }
+  }
+
+  let timer = null;
+  async function poll() {
+    try {
+      const r = await fetch('/api/tasks');
+      if (!r.ok) return;
+      const d = await r.json();
+      render(d.tasks || []);
+    } catch (_) {}
+  }
+
+  function start() {
+    if (timer !== null) return;
+    poll();
+    timer = setInterval(poll, 2000);
+  }
+  function stop() {
+    if (timer === null) return;
+    clearInterval(timer);
+    timer = null;
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) stop(); else start();
+  });
+
+  const clearBtn = document.getElementById('tasks-clear');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', async () => {
+      clearBtn.disabled = true;
+      try {
+        await fetch('/api/tasks/clear', { method: 'POST' });
+      } catch (_) {}
+      clearBtn.disabled = false;
+      poll();
+    });
+  }
+
+  if (!document.hidden) start();
+})();
+</script>
 
 <div class="donate-footer">
   <div class="donate-message">{{ donation_message }}</div>
@@ -2620,6 +2876,26 @@ def settings():
 # ------------------------------------------------------------------
 # Browser Extension API
 # ------------------------------------------------------------------
+
+@app.route("/api/tasks/clear", methods=["POST"])
+def api_tasks_clear():
+    if "user_id" not in session:
+        return {"ok": False}, 403
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM download_tasks WHERE user_id=? AND finished_at IS NOT NULL",
+            (session["user_id"],),
+        )
+    return {"ok": True}, 200
+
+
+@app.route("/api/tasks")
+def api_tasks():
+    if "user_id" not in session:
+        return {"tasks": []}, 200
+    tasks = get_user_tasks(session["user_id"], limit=5)
+    return {"tasks": tasks}, 200
+
 
 @app.route("/api/extension-login", methods=["POST"])
 def api_extension_login():
