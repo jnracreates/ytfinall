@@ -1,8 +1,8 @@
 services:
   ytfinall:
-    build: .
-    # After you publish the image, comment out `build: .` and uncomment:
-    # image: ghcr.io/jnracreates/ytfinall:latest
+    image: ghcr.io/jnracreates/ytfinall:latest
+    # To build from source instead, comment out the line above and uncomment:
+    # build: .
     container_name: ytfinall
     extra_hosts:
       - "host.docker.internal:host-gateway"
