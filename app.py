@@ -663,9 +663,15 @@ def refresh_jellyfin_library(lib_id):
 def build_ytdlp_cmd(user_id, url, custom_name=None, cutoff_date=None):
     # If it's a channel root, force the /videos tab so we don't scan
     # streams/shorts separately (which triples the number of requests).
+    # A watch URL is a single video even if it has a &list= parameter.
+    # Only treat pure playlist URLs (no v= parameter) as channels/playlists.
+    is_playlist_only = (
+        "/playlist" in url
+        or ("list=" in url and "watch?v=" not in url and "youtu.be/" not in url)
+    )
     is_single_video = (
         ("youtube.com/watch" in url or "youtu.be/" in url)
-        and "list=" not in url
+        and not is_playlist_only
     )
 
     if not is_single_video and "youtube.com/@" in url and not any(
@@ -745,6 +751,9 @@ def build_ytdlp_cmd(user_id, url, custom_name=None, cutoff_date=None):
     if not is_single_video:
         cmd += ["--match-filter", f"upload_date >= {dateafter} & aspect_ratio>=1"]
         cmd += ["--break-on-reject"]
+    else:
+        # Single video: ignore any &list= playlist context in the URL
+        cmd += ["--no-playlist"]
 
     cmd += extra_ytdlp_args()
     cmd += ["-o", outtmpl]
@@ -2492,9 +2501,13 @@ def api_download():
             ).start()
 
     # Determine type and queue download
+    is_playlist_only = (
+        "/playlist" in target_url
+        or ("list=" in target_url and "watch?v=" not in target_url and "youtu.be/" not in target_url)
+    )
     is_single = (
         ("youtube.com/watch" in target_url or "youtu.be/" in target_url)
-        and "list=" not in target_url
+        and not is_playlist_only
     )
     url_type = "video" if is_single else "channel"
 
