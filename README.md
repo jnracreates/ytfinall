@@ -65,7 +65,6 @@ into a private Jellyfin library that only they can see.
 ## Jellyfin integration
 
 - Creates a private `ytfinall - <username>` library on first login
-- YouTubeMetadata set as the primary metadata fetcher
 - Real-time monitoring enabled
 - Users keep access to their existing Jellyfin libraries
 - Users never see each other's ytfinall libraries
