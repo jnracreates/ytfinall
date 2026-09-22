@@ -983,17 +983,19 @@ threading.Thread(target=scheduler_loop, daemon=True).start()
 # Templates
 # ------------------------------------------------------------------
 BASE_CSS = """
-body{font-family:sans-serif;max-width:760px;margin:40px auto;padding:0 20px;color:#222}
-h2{margin-bottom:0.3em}
-input,select{width:100%;padding:10px;margin:6px 0 14px;box-sizing:border-box;font-size:16px;border:1px solid #ccc;border-radius:4px}
-button{padding:11px 22px;background:#00a4dc;color:#fff;border:none;cursor:pointer;font-size:16px;border-radius:4px}
+*{box-sizing:border-box}
+body{font-family:sans-serif;max-width:760px;margin:0 auto;padding:16px;color:#222;-webkit-text-size-adjust:100%}
+h2{margin-bottom:0.3em;font-size:1.5em}
+h3{font-size:1.2em;margin-top:1.5em}
+input,select{width:100%;padding:12px;margin:6px 0 14px;font-size:16px;border:1px solid #ccc;border-radius:4px}
+button{padding:12px 22px;background:#00a4dc;color:#fff;border:none;cursor:pointer;font-size:16px;border-radius:4px}
 button:hover{background:#0088b8}
 .error{color:#c00;background:#fee;padding:10px;border-radius:4px}
 .ok{color:#0a5;background:#e7f8ee;padding:10px;border-radius:4px}
-table{width:100%;border-collapse:collapse;margin-top:14px}
-td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left}
+table{width:100%;border-collapse:collapse;margin-top:14px;font-size:14px}
+td,th{padding:8px;border-bottom:1px solid #ddd;text-align:left}
 .small{color:#666;font-size:0.9em}
-.header{display:flex;justify-content:space-between;align-items:center}
+.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
 label{display:block;font-weight:600;margin-top:6px}
 .card{background:#f7f9fb;border:1px solid #e1e6eb;border-radius:6px;padding:14px 18px;margin:18px 0}
 a{color:#00a4dc;text-decoration:none}
@@ -1020,10 +1022,28 @@ a:hover{text-decoration:underline}
 .donate-links { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
 .donate-link { display: inline-block; padding: 8px 16px; background: #f7f9fb; border: 1px solid #e1e6eb; border-radius: 6px; color: #00a4dc; font-size: 14px; font-weight: 600; text-decoration: none; transition: background 0.15s, border-color 0.15s; }
 .donate-link:hover { background: #e3f2fd; border-color: #00a4dc; text-decoration: none; }
+
+/* Mobile responsive */
+@media (max-width: 600px) {
+  body { padding: 12px; margin: 0; }
+  h2 { font-size: 1.3em; }
+  h3 { font-size: 1.1em; }
+  .logo { max-width: 160px; }
+  .logo-sm { max-width: 120px; }
+  .input-row { flex-wrap: wrap; }
+  .input-row input, .input-row select { width: 100%; }
+  .info-btn { width: 100%; text-align: center; padding: 8px; }
+  table { font-size: 13px; }
+  td,th { padding: 6px; }
+  .header { flex-direction: column; align-items: flex-start; gap: 6px; }
+  .header > div { width: 100%; }
+  .donate-links { flex-direction: column; }
+  .donate-link { width: 100%; text-align: center; }
+}
 """
 
 LOGIN_PAGE = """
-<!DOCTYPE html><html><head><title>ytfinall — Login</title><link rel="icon" type="image/png" href="/static/favicon.png">
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>ytfinall — Login</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <img src="/static/logo.png" alt="ytfinall" class="logo">
 <p>Log in with your Jellyfin account.</p>
@@ -1039,7 +1059,7 @@ LOGIN_PAGE = """
 """
 
 SETUP_PAGE = """
-<!DOCTYPE html><html><head><title>ytfinall — Setup</title><link rel="icon" type="image/png" href="/static/favicon.png">
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>ytfinall — Setup</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <img src="/static/logo.png" alt="ytfinall" class="logo">
 <h2>Welcome to ytfinall</h2>
@@ -1120,7 +1140,7 @@ SETUP_PAGE = """
 """
 
 DASHBOARD = """
-<!DOCTYPE html><html><head><title>ytfinall</title><link rel="icon" type="image/png" href="/static/favicon.png">
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>ytfinall</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <div class="header">
   <img src="/static/logo.png" alt="ytfinall" class="logo-sm">
@@ -1228,6 +1248,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 </form>
 
 <h3>Your sources</h3>
+<div style="overflow-x:auto">
 <table>
 <tr><th>Name</th><th>URL</th><th>Cutoff</th><th>Retention</th><th></th></tr>
 {% for s in sources %}
@@ -1247,6 +1268,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 </tr>
 {% endfor %}
 </table>
+</div>
 
 <div class="donate-footer">
   <div class="donate-message">{{ donation_message }}</div>
@@ -1262,7 +1284,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 """
 
 SETTINGS_PAGE = """
-<!DOCTYPE html><html><head><title>ytfinall — Settings</title><link rel="icon" type="image/png" href="/static/favicon.png">
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>ytfinall — Settings</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <img src="/static/logo.png" alt="ytfinall" class="logo">
 <h2>Admin settings</h2>
@@ -1607,7 +1629,7 @@ document.querySelectorAll('.admin-archive-btn').forEach(btn => {
 """
 
 EDIT_PAGE = """
-<!DOCTYPE html><html><head><title>ytfinall — Edit source</title><link rel="icon" type="image/png" href="/static/favicon.png">
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>ytfinall — Edit source</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
 <img src="/static/logo.png" alt="ytfinall" class="logo">
 <h2>Edit source</h2>
