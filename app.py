@@ -195,7 +195,7 @@ init_db()
 
 
 def _now_iso():
-    return datetime.datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
 
 
 def create_task(user_id, url, kind):
@@ -235,7 +235,7 @@ def get_user_tasks(user_id, limit=5):
 
 
 def purge_old_tasks(user_id, age_seconds=600):
-    cutoff = (datetime.datetime.utcnow()
+    cutoff = (datetime.datetime.now(datetime.UTC)
               - datetime.timedelta(seconds=age_seconds)
               ).isoformat(timespec="seconds")
     with db() as conn:
@@ -1690,7 +1690,7 @@ SETUP_PAGE = """
     </div>
     <input type="checkbox" id="setup-key" class="info-toggle">
     <div class="info-box">
-      <strong>Security & Generation:</strong> Navigate to your Jellyfin administrator panel dashboard, scroll to <em>Advanced → API Keys</em>, generate a dedicated system token named <code>ytfinall</code>, and paste it here. This enables automated catalog generation.
+      <strong>Security & Generation:</strong> Navigate to your Jellyfin administrator panel dashboard, scroll to <em>Advanced → API Keys</em>, generate a dedicated system token named <code>ytfinall</code>, and paste it here. This enables automated library generation.
     </div>
   </div>
 
@@ -1813,7 +1813,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
     </div>
     <input type="checkbox" id="info-name" class="info-toggle">
     <div class="info-box">
-      <strong>What this does:</strong> Sets the display folder name inside your isolated Jellyfin dynamic catalog structure. If left blank, your server will automatically request and match the channel's native YouTube publisher name.
+      <strong>What this does:</strong> Sets the display folder name inside your Jellyfin library. If left blank, the channel's actual YouTube name is used automatically.
     </div>
   </div>
 
@@ -2024,7 +2024,7 @@ SETTINGS_PAGE = """
       </div>
       <input type="checkbox" id="settings-key" class="info-toggle">
       <div class="info-box">
-        <strong>Security & Generation:</strong> Navigate to your Jellyfin administrator panel dashboard, scroll to <em>Advanced → API Keys</em>, generate a dedicated system token named <code>ytfinall</code>, and paste it here. This enables automated catalog generation.
+        <strong>Security & Generation:</strong> Navigate to your Jellyfin administrator panel dashboard, scroll to <em>Advanced → API Keys</em>, generate a dedicated system token named <code>ytfinall</code>, and paste it here. This enables automated library generation.
       </div>
     </div>
 
@@ -2495,7 +2495,7 @@ EDIT_PAGE = """
     </div>
     <input type="checkbox" id="edit-name" class="info-toggle">
     <div class="info-box">
-      <strong>What this does:</strong> Sets the display folder name inside your isolated Jellyfin dynamic catalog structure. If left blank, your server will automatically request and match the channel's native YouTube publisher name.
+      <strong>What this does:</strong> Sets the display folder name inside your Jellyfin library. If left blank, the channel's actual YouTube name is used automatically.
     </div>
   </div>
 
