@@ -200,6 +200,35 @@ docker compose up -d
 If you run from the source tree (with build: . in the compose),
 replace docker compose pull with docker compose build.
 
+## Browser Extension
+
+A companion browser extension lets you right-click any YouTube video, channel, or playlist and send it straight to your ytfinall server without copy-pasting.
+
+**Install:**
+
+- **Microsoft Edge Add-ons** — [ytfinall Connector](https://microsoftedge.microsoft.com/addons/detail/ytfinall-connector/hdfpngaekagheekoajkjhdjoomppmlhj)
+- **Firefox Add-ons (AMO)** — pending review
+- **Chrome Web Store** — not available (extension download policy). See manual install below.
+
+**Works on:**
+- Microsoft Edge (desktop and mobile)
+- Firefox (desktop and Android — pending AMO approval)
+- Any Chromium browser that can install from the Edge Add-ons store
+
+**Mobile note:** Right-click menus don't exist on mobile browsers. On mobile, tap the extension icon and paste the YouTube URL into the popup instead.
+
+**How it works:**
+1. Click the extension icon and log in with your Jellyfin credentials
+2. Right-click any YouTube link (or paste a URL on mobile)
+3. The URL is sent to your ytfinall server and queued for download
+4. The video appears in your Jellyfin library when the download completes
+
+### Chrome — manual install
+
+The Chrome Web Store does not accept extensions that facilitate YouTube downloads. To install manually:
+
+1. Clone the repository:
+
 ### Notes
 
     Videos are always limited to the admin's lookback window. A user's
