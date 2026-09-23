@@ -1383,8 +1383,20 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
     except Exception as e:
         print(f"[download] error: {e}", flush=True)
 
+    # Count real media files in staging — the true number of videos
+    # that will land in the library. yt-dlp's Destination lines include
+    # thumbnails, separate video/audio streams, and other non-video files.
+    real_videos = 0
     if success:
-        if downloaded == 0:
+        media_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
+                      ".mp3", ".m4a", ".flac", ".opus", ".ogg"}
+        for walk_root, _, walk_files in os.walk(staging_dir):
+            for n in walk_files:
+                if os.path.splitext(n)[1].lower() in media_exts:
+                    real_videos += 1
+
+    if success:
+        if real_videos == 0:
             # Nothing downloaded — remove the task entirely so the user
             # doesn't see a stale "no-op" entry every scan cycle.
             try:
@@ -1395,7 +1407,7 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
                 pass
         else:
             finish_task(task_id, "complete",
-                        f"Done. {downloaded} video(s) will appear on Jellyfin shortly.")
+                        f"Done. {real_videos} video(s) will appear on Jellyfin shortly.")
     else:
         finish_task(task_id, "failed",
                     "Download failed. Check the admin logs for details.")
