@@ -347,6 +347,41 @@ def archive_stats(user_id):
         return sum(1 for line in f if line.strip()), True
 
 
+def get_user_stats(username):
+    """Walk a user's media folder and return video count + total bytes."""
+    safe = safe_username(username)
+    root = f"{MEDIA_ROOT}/{safe}/shows"
+    if not os.path.isdir(root):
+        return {"videos": 0, "bytes": 0, "folders": 0}
+    media_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
+                  ".mp3", ".m4a", ".flac", ".opus", ".ogg"}
+    videos = 0
+    total = 0
+    folders = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        folders += 1
+        for name in filenames:
+            ext = os.path.splitext(name)[1].lower()
+            if ext in media_exts:
+                try:
+                    size = os.path.getsize(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+                videos += 1
+                total += size
+    return {"videos": videos, "bytes": total, "folders": folders}
+
+
+def _fmt_bytes(n):
+    """Format bytes as a human-readable string."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.2f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.2f} TB"
+
+
 def build_user_list():
     """Return a list of users with their source and archive counts."""
     result = []
@@ -2183,6 +2218,27 @@ SETTINGS_PAGE = """
 </div>
 
 <div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
+  <label>User storage</label>
+  <p class="small">Video count and disk usage per user. Computed on demand — may take a moment for large libraries.</p>
+  <div id="user-stats-loading" class="small">Loading stats…</div>
+  <div id="user-stats-box" style="display:none">
+    <table id="user-stats-table" style="width:100%;border-collapse:collapse;margin-top:8px">
+      <thead>
+        <tr style="border-bottom:1px solid #ddd">
+          <th style="text-align:left;padding:8px">User</th>
+          <th style="text-align:right;padding:8px">Videos</th>
+          <th style="text-align:right;padding:8px">Folders</th>
+          <th style="text-align:right;padding:8px">Storage</th>
+        </tr>
+      </thead>
+      <tbody id="user-stats-body"></tbody>
+      <tfoot id="user-stats-foot"></tfoot>
+    </table>
+    <button type="button" id="user-stats-refresh" style="background:#888;padding:6px 12px;font-size:13px;margin-top:10px">Refresh</button>
+  </div>
+</div>
+
+<div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
   <label>Live logs</label>
   <p class="small">Updates every 2 seconds while this tab is visible. Shows the last 500 lines.</p>
   <div id="log-box" style="background:#111;color:#0f0;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:12px;padding:12px;border-radius:6px;height:320px;overflow-y:auto;white-space:pre-wrap;line-height:1.35;word-break:break-all">Loading…</div>
@@ -2318,6 +2374,62 @@ SETTINGS_PAGE = """
       box.textContent = '(cleared)';
     });
   }
+})();
+
+// User storage stats
+(function () {
+  const loading = document.getElementById('user-stats-loading');
+  const box = document.getElementById('user-stats-box');
+  const tbody = document.getElementById('user-stats-body');
+  const tfoot = document.getElementById('user-stats-foot');
+  const refreshBtn = document.getElementById('user-stats-refresh');
+  if (!loading || !box || !tbody) return;
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[<>&]/g,
+      c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+  }
+
+  async function load() {
+    loading.style.display = 'block';
+    loading.textContent = 'Loading stats…';
+    box.style.display = 'none';
+
+    try {
+      const r = await fetch('/admin/user-stats');
+      if (!r.ok) {
+        loading.textContent = 'Error: ' + r.status;
+        return;
+      }
+      const d = await r.json();
+      tbody.innerHTML = '';
+      for (const u of d.users || []) {
+        const tr = document.createElement('tr');
+        tr.style.borderBottom = '1px solid #eee';
+        tr.innerHTML =
+          '<td style="padding:6px">' + esc(u.username) + '</td>' +
+          '<td style="padding:6px;text-align:right">' + u.videos + '</td>' +
+          '<td style="padding:6px;text-align:right">' + u.folders + '</td>' +
+          '<td style="padding:6px;text-align:right">' + esc(u.bytes_human) + '</td>';
+        tbody.appendChild(tr);
+      }
+      tfoot.innerHTML =
+        '<tr style="border-top:2px solid #ddd;font-weight:600">' +
+        '<td style="padding:8px">Total</td>' +
+        '<td style="padding:8px;text-align:right">' + d.total_videos + '</td>' +
+        '<td style="padding:8px;text-align:right"></td>' +
+        '<td style="padding:8px;text-align:right">' + esc(d.total_bytes_human) + '</td>' +
+        '</tr>';
+
+      loading.style.display = 'none';
+      box.style.display = 'block';
+    } catch (e) {
+      loading.textContent = 'Error: ' + e.message;
+    }
+  }
+
+  if (refreshBtn) refreshBtn.addEventListener('click', load);
+  load();
 })();
 
 // Admin archive controls
@@ -2737,6 +2849,42 @@ def admin_logs():
     with _log_lock:
         lines = list(_log_buffer)
     return {"lines": lines}, 200
+
+
+@app.route("/admin/user-stats")
+def admin_user_stats():
+    """Return video count + storage for each user. Admin only."""
+    if "user_id" not in session or not session.get("is_admin"):
+        return {"error": "admin only"}, 403
+    if not session.get("settings_unlocked"):
+        return {"error": "settings locked"}, 403
+
+    with db() as conn:
+        users = conn.execute(
+            "SELECT user_id, username FROM users ORDER BY username"
+        ).fetchall()
+
+    results = []
+    for u in users:
+        username = u["username"] or u["user_id"]
+        stats = get_user_stats(username)
+        results.append({
+            "username": username,
+            "videos": stats["videos"],
+            "folders": stats["folders"],
+            "bytes": stats["bytes"],
+            "bytes_human": _fmt_bytes(stats["bytes"]),
+        })
+
+    total_videos = sum(r["videos"] for r in results)
+    total_bytes = sum(r["bytes"] for r in results)
+
+    return {
+        "users": results,
+        "total_videos": total_videos,
+        "total_bytes": total_bytes,
+        "total_bytes_human": _fmt_bytes(total_bytes),
+    }, 200
 
 
 @app.route("/admin/clear-archive/<user_id>", methods=["POST"])
