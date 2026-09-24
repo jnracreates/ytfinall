@@ -1675,7 +1675,7 @@ a:hover{text-decoration:underline}
 .info-btn { background: #555; color: #fff; border: none; cursor: pointer; padding: 10px 14px; font-size: 15px; border-radius: 4px; font-weight: bold; white-space: nowrap; transition: background 0.2s; }
 .info-btn:hover { background: #333; }
 .info-toggle { display: none; }
-.info-toggle:checked + .info-box { display: block; }
+.info-toggle:checked ~ .info-box { display: block; }
 .info-box { display: none; background: #f0f4f8; border-left: 4px solid #00a4dc; padding: 12px 16px; margin: 8px 0 16px 0; border-radius: 0 4px 4px 0; font-size: 14px; color: #333; line-height: 1.5; }
 .info-box ul { margin: 6px 0 0 0; padding-left: 20px; }
 .info-box li { margin-bottom: 4px; }
@@ -1741,7 +1741,7 @@ SETUP_PAGE = """
 .info-btn { background: #555; color: #fff; border: none; cursor: pointer; padding: 10px 14px; font-size: 15px; border-radius: 4px; font-weight: bold; white-space: nowrap; transition: background 0.2s; display: inline-block; text-align: center; line-height: 1.2; }
 .info-btn:hover { background: #333; }
 .info-toggle { display: none; }
-.info-toggle:checked + .info-box { display: block; }
+.info-toggle:checked ~ .info-box { display: block; }
 .info-box { display: none; background: #f0f4f8; border-left: 4px solid #00a4dc; padding: 12px 16px; margin: 8px 0 16px 0; border-radius: 0 4px 4px 0; font-size: 14px; color: #333; line-height: 1.5; box-sizing: border-box; }
 .info-box ul { margin: 6px 0 0 0; padding-left: 20px; }
 .info-box li { margin-bottom: 4px; }
@@ -2049,6 +2049,30 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
   if (!document.hidden) start();
 })();
 </script>
+
+<div class="card" style="margin-top:32px">
+  <h3 style="margin-top:0">Browser Extension</h3>
+  <p class="small">A companion browser extension lets you right-click any YouTube video, channel, or playlist and send it straight to your ytfinall server without copy-pasting.</p>
+  <label for="info-extension" class="info-btn" style="display:inline-block;margin-top:10px">Show install instructions</label>
+  <input type="checkbox" id="info-extension" class="info-toggle">
+  <div class="info-box" style="margin-top:10px">
+    <p style="margin-top:0"><strong>Install:</strong></p>
+    <ul>
+      <li><a href="https://microsoftedge.microsoft.com/addons/detail/ytfinall-connector/hdfpngaekagheekoajkjhdjoomppmlhj" target="_blank" rel="noopener noreferrer">Microsoft Edge Add-ons — ytfinall Connector</a></li>
+      <li>Firefox Add-ons (AMO) — pending review</li>
+      <li>Chrome — <a href="https://github.com/jnracreates/ytfinall/blob/main/INSTALL_CHROME.md" target="_blank" rel="noopener noreferrer">manual install required</a> (Chrome Web Store policy)</li>
+    </ul>
+    <p><strong>Works on:</strong> Microsoft Edge (desktop and mobile), Firefox (desktop and Android — pending AMO approval), any Chromium browser that can install from the Edge Add-ons store, and Chrome via the manual install guide.</p>
+    <p><strong>Mobile note:</strong> Right-click menus don't exist on mobile browsers. On mobile, tap the extension icon and paste the YouTube URL into the popup instead.</p>
+    <p style="margin-bottom:6px"><strong>How it works:</strong></p>
+    <ol style="margin:0">
+      <li>Click the extension icon and log in with your Jellyfin credentials</li>
+      <li>Right-click any YouTube link (or paste a URL on mobile)</li>
+      <li>The URL is sent to your ytfinall server and queued for download</li>
+      <li>The video appears in your Jellyfin library when the download completes</li>
+    </ol>
+  </div>
+</div>
 
 <div class="donate-footer">
   <div class="donate-message">{{ donation_message }}</div>
