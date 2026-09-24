@@ -7,3 +7,5 @@ __pycache__/
 config/cookies.txt.bak
 archive-before-loss*.txt
 docker-compose.override.yml
+ytfinall-extension/**/*.zip
+ytfinall-extension/store-assets/
