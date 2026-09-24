@@ -45,7 +45,7 @@ delete the folder, the extension stops working.
 git clone https://github.com/jnracreates/ytfinall.git
 ```
 
-The extension lives in the `ytfinall-extension/` folder inside the repo.
+The extension lives in the `ytfinall-extension/chrome/` folder inside the repo.
 
 ---
 
@@ -73,8 +73,9 @@ Once Developer mode is on, three new buttons appear in the top-left:
 1. Click **Load unpacked**
 2. Chrome opens a file picker. Navigate to the folder you extracted in
    Step 1
-3. Select the folder (single-click it) and click **Select Folder**
-   (Windows) or **Open** (macOS/Linux)
+3. Navigate to the `chrome/` folder inside `ytfinall-extension/` and
+   select it (single-click it), then click **Select Folder** (Windows)
+   or **Open** (macOS/Linux)
 
 **Important:** Select the folder that contains `manifest.json`
 directly. If you extracted the zip and got a nested folder like
