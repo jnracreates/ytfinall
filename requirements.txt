@@ -2,3 +2,5 @@ flask
 requests
 yt-dlp[default]
 flask-cors
+flask-limiter
+waitress

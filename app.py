@@ -1,6 +1,11 @@
 import os, sqlite3, subprocess, threading, time, datetime, requests, shutil, re
-from flask import Flask, request, redirect, render_template_string, session, jsonify
+from flask import Flask, request, redirect, render_template_string, session, jsonify, abort
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+# Owner-only permissions for everything this process creates.
+os.umask(0o077)
 
 def apply_animated_library_cover(user_media_folder):
     """
@@ -28,7 +33,21 @@ def apply_animated_library_cover(user_media_folder):
 
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB body cap
+app.jinja_env.autoescape = True  # render_template_string does NOT autoescape
+# Restrict CORS to your extension's origin. Replace the placeholders
+# with your real IDs, or leave as-is if you don't have an extension yet
+# (the web UI is same-origin and unaffected by CORS).
+CORS(app, resources={r"/api/*": {"origins": [
+    "chrome-extension://REPLACE_WITH_CHROME_EXTENSION_ID",
+    "moz-extension://REPLACE_WITH_FIREFOX_EXTENSION_ID",
+]}})
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
 
 
 # ------------------------------------------------------------------
@@ -73,7 +92,11 @@ class _TeeStdout:
                     continue
                 if "/admin/logs" in line:
                     continue
-                _log_buffer.append(line)
+                # Redact query strings and auth tokens before exposing
+                # to the admin UI. Raw stdout still gets the original.
+                redacted = re.sub(r"(\?|&)[^\s]*", r"\1<redacted>", line)
+                redacted = re.sub(r'Token="[^"]+"', 'Token="<redacted>"', redacted)
+                _log_buffer.append(redacted)
 
     def flush(self):
         # Emit any dangling partial line so it isn't lost on shutdown
@@ -168,7 +191,24 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
                 username TEXT,
-                library_id TEXT
+                library_id TEXT,
+                is_admin INTEGER DEFAULT 0
+            )
+        """)
+        # Idempotent migration for DBs created before is_admin existed.
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        # Opaque tokens issued to the browser extension. Only hashes
+        # are stored, so a DB read does not yield usable credentials.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                username TEXT,
+                created_at TEXT,
+                expires_at TEXT
             )
         """)
         conn.execute("""
@@ -408,6 +448,36 @@ def build_user_list():
 _last_update = 0.0
 _update_lock = threading.Lock()
 _download_lock = threading.Lock()
+
+# Bounded download queue with a fixed worker pool. Prevents unbounded
+# thread spawning under load.
+import queue as _queue
+_download_queue: "_queue.Queue[tuple]" = _queue.Queue(maxsize=32)
+
+
+def _download_worker():
+    while True:
+        job = _download_queue.get()
+        try:
+            user_id, url, name, cutoff = job
+            run_download(user_id, url, name, cutoff)
+        except Exception as e:
+            print(f"[queue] worker error: {e}", flush=True)
+        finally:
+            _download_queue.task_done()
+
+
+for _ in range(2):
+    threading.Thread(target=_download_worker, daemon=True).start()
+
+
+def enqueue_download(user_id, url, name=None, cutoff=None) -> bool:
+    """Return False if the queue is full."""
+    try:
+        _download_queue.put_nowait((user_id, url, name, cutoff))
+        return True
+    except _queue.Full:
+        return False
 
 
 def ensure_ytdlp_updated(force=False):
@@ -1551,8 +1621,8 @@ def scheduler_loop():
                 with db() as conn:
                     rows = conn.execute("SELECT * FROM sources").fetchall()
                 for row in rows:
-                    run_download(row["user_id"], row["url"],
-                                 row["name"], row["cutoff"])
+                    enqueue_download(row["user_id"], row["url"],
+                                     row["name"], row["cutoff"])
             except Exception as e:
                 print(f"[scheduler] index error: {e}")
             last_index = now
@@ -2558,6 +2628,19 @@ def require_setup():
         return redirect("/setup")
 
 
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data: https:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
+    )
+    return resp
+
+
 # ------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------
@@ -2636,20 +2719,24 @@ def login():
             session["user_id"] = uid
             session["username"] = request.form["username"]
             with db() as conn:
-                count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-                if count == 0:
-                    # First-ever user becomes admin and is persisted as such.
-                    conn.execute(
-                        "INSERT OR IGNORE INTO users (user_id, username, is_admin) "
-                        "VALUES (?,?,1)",
-                        (uid, request.form["username"]),
-                    )
-                    session["is_admin"] = True
-                else:
-                    row = conn.execute(
-                        "SELECT is_admin FROM users WHERE user_id=?", (uid,)
-                    ).fetchone()
-                    session["is_admin"] = bool(row and row["is_admin"])
+                # Ensure the user row exists.
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (user_id, username, is_admin) "
+                    "VALUES (?,?,0)",
+                    (uid, request.form["username"]),
+                )
+                # Atomic first-admin promotion: only fires when this user
+                # is the sole row. Simultaneous first logins cannot both win.
+                conn.execute(
+                    "UPDATE users SET is_admin=1 "
+                    "WHERE user_id=? AND (SELECT COUNT(*) FROM users)=1",
+                    (uid,),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT is_admin FROM users WHERE user_id=?", (uid,)
+                ).fetchone()
+                session["is_admin"] = bool(row and row["is_admin"])
             threading.Thread(
                 target=ensure_user_library,
                 args=(uid, request.form["username"]),
@@ -2702,11 +2789,8 @@ def add_source():
             (session["user_id"], url, name, cutoff, retention),
         )
 
-    threading.Thread(
-        target=run_download,
-        args=(session["user_id"], url, name, cutoff),
-        daemon=True,
-    ).start()
+    if not enqueue_download(session["user_id"], url, name, cutoff):
+        return "Download queue is full. Try again shortly.", 503
     return redirect("/")
 
 
@@ -2788,9 +2872,25 @@ def upload_cookies():
         return {"ok": False, "message": "File must be a .txt"}, 400
 
     raw = file.read()
-    if b"youtube" not in raw.lower() and b"google" not in raw.lower():
+    # Parse as a Netscape cookie file; reject anything malformed.
+    import http.cookiejar as _cj
+    import io as _io
+    try:
+        jar = _cj.MozillaCookieJar()
+        jar._really_load(
+            _io.StringIO(raw.decode("utf-8", errors="replace")),
+            str(COOKIES_FILE),
+            ignore_discard=True,
+            ignore_expires=True,
+        )
+    except Exception:
         return {"ok": False,
-                "message": "That doesn't look like a YouTube cookies file."}, 400
+                "message": "File is not a valid Netscape cookies.txt export."}, 400
+
+    domains = {c.domain.lower() for c in jar}
+    if not any("youtube.com" in d or "google.com" in d for d in domains):
+        return {"ok": False,
+                "message": "No YouTube/Google cookies found in this file."}, 400
 
     os.makedirs(CONFIG_DIR, exist_ok=True)
     if os.path.exists(COOKIES_FILE):
@@ -2800,6 +2900,12 @@ def upload_cookies():
             pass
     with open(COOKIES_FILE, "wb") as f:
         f.write(raw)
+    try:
+        os.chmod(COOKIES_FILE, 0o600)
+        if os.path.exists(COOKIES_FILE + ".bak"):
+            os.chmod(COOKIES_FILE + ".bak", 0o600)
+    except OSError:
+        pass
 
     print(f"[cookies] wrote {len(raw)} bytes to {COOKIES_FILE}", flush=True)
     return {"ok": True, "message": f"Saved cookies.txt ({len(raw)} bytes)."}
@@ -2816,40 +2922,8 @@ def admin_logs_clear():
     return {"ok": True}, 200
 
 
-@app.route("/admin/logs/debug")
-def admin_logs_debug():
-    import sys
-    return {
-        "stdout_class": type(sys.stdout).__name__,
-        "stdout_id": id(sys.stdout),
-        "buffer_len": len(_log_buffer),
-        "buffer_sample": list(_log_buffer)[-3:],
-    }, 200
-
-
-@app.route("/admin/logs/test")
-def admin_logs_test():
-    import sys
-    before = len(_log_buffer)
-    buf_id = id(_log_buffer)
-    stdout_id = id(sys.stdout)
-    # Direct write to test the Tee
-    sys.stdout.write("[test] direct stdout write\n")
-    sys.stdout.flush()
-    after_write = len(_log_buffer)
-    # Now via print()
-    print("[test] via print()", flush=True)
-    after_print = len(_log_buffer)
-    return {
-        "buffer_id": buf_id,
-        "stdout_id": stdout_id,
-        "stdout_class": type(sys.stdout).__name__,
-        "len_before": before,
-        "len_after_write": after_write,
-        "len_after_print": after_print,
-        "buffer_tail": list(_log_buffer)[-5:],
-    }, 200
-
+# (debug/test endpoints removed — they exposed internal state and
+# were not needed in production.)
 
 @app.route("/admin/logs")
 def admin_logs():
@@ -2931,21 +3005,30 @@ def retrigger_user(user_id):
             "SELECT * FROM sources WHERE user_id=?", (user_id,)
         ).fetchall()
 
+    queued = 0
     for row in rows:
-        threading.Thread(
-            target=run_download,
-            args=(row["user_id"], row["url"], row["name"], row["cutoff"]),
-            daemon=True,
-        ).start()
+        if enqueue_download(row["user_id"], row["url"],
+                            row["name"], row["cutoff"]):
+            queued += 1
 
-    print(f"[admin] retriggered {len(rows)} sources for {user_id}", flush=True)
-    return {"ok": True, "message": f"Queued {len(rows)} sources for rescan."}, 200
+    print(f"[admin] retriggered {queued}/{len(rows)} sources for {user_id}", flush=True)
+    return {"ok": True, "message": f"Queued {queued} of {len(rows)} sources for rescan."}, 200
+
+
+def require_admin():
+    """Abort unless the current session belongs to an admin."""
+    if "user_id" not in session:
+        abort(401)
+    if not session.get("is_admin"):
+        abort(403)
 
 
 @app.route("/settings", methods=["GET", "POST"])
 def settings():
     if "user_id" not in session:
         return redirect("/login")
+    if not session.get("is_admin"):
+        return redirect("/")
 
     locked = not session.get("settings_unlocked")
 
@@ -3063,16 +3146,62 @@ def api_tasks():
     return {"tasks": tasks}, 200
 
 
+def _hash_token(raw: str) -> str:
+    import hashlib
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def issue_api_token(user_id: str, username: str, ttl_days: int = 30) -> str:
+    """Mint an opaque token, store only its hash, return the raw value once."""
+    import secrets
+    raw = secrets.token_urlsafe(32)
+    now = datetime.datetime.now(datetime.UTC)
+    exp = now + datetime.timedelta(days=ttl_days)
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO api_tokens "
+            "(token_hash, user_id, username, created_at, expires_at) "
+            "VALUES (?,?,?,?,?)",
+            (_hash_token(raw), user_id, username,
+             now.isoformat(timespec="seconds"),
+             exp.isoformat(timespec="seconds")),
+        )
+    return raw
+
+
+def validate_api_token(raw: str):
+    """Return (user_id, username) if the token is valid and unexpired."""
+    if not raw:
+        return None, None
+    now = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    th = _hash_token(raw)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT user_id, username, expires_at FROM api_tokens "
+            "WHERE token_hash=?",
+            (th,),
+        ).fetchone()
+    if not row:
+        return None, None
+    if row["expires_at"] and row["expires_at"] < now:
+        with db() as conn:
+            conn.execute("DELETE FROM api_tokens WHERE token_hash=?", (th,))
+        return None, None
+    return row["user_id"], row["username"]
+
+
 @app.route("/api/extension-login", methods=["POST"])
+@limiter.limit("5 per minute; 20 per hour")
 def api_extension_login():
-    """Login for the browser extension. Trades Jellyfin credentials for a token."""
+    """Trade Jellyfin credentials for our own opaque token."""
     data = request.get_json(silent=True)
     if not data or not data.get("username") or not data.get("password"):
         return jsonify({"error": "Username and password required"}), 400
 
-    uid, token = jellyfin_login(data["username"], data["password"])
-    if not uid or not token:
-        return jsonify({"error": "Invalid Jellyfin credentials"}), 401
+    uid, _jellyfin_token = jellyfin_login(data["username"], data["password"])
+    if not uid:
+        # Generic error; do not reveal whether the username exists.
+        return jsonify({"error": "Invalid credentials"}), 401
 
     with db() as conn:
         row = conn.execute(
@@ -3080,7 +3209,8 @@ def api_extension_login():
         ).fetchone()
         if not row:
             conn.execute(
-                "INSERT INTO users (user_id, username, is_admin) VALUES (?,?,0)",
+                "INSERT OR IGNORE INTO users (user_id, username, is_admin) "
+                "VALUES (?,?,0)",
                 (uid, data["username"]),
             )
             threading.Thread(
@@ -3089,14 +3219,16 @@ def api_extension_login():
                 daemon=True,
             ).start()
 
+    raw_token = issue_api_token(uid, data["username"])
     return jsonify({
-        "token": token,
+        "token": raw_token,
         "user_id": uid,
         "username": data["username"],
     }), 200
 
 
 @app.route("/api/download", methods=["POST"])
+@limiter.limit("10 per minute; 100 per day")
 def api_download():
     """Endpoint for the browser extension to queue a download."""
     data = request.get_json(silent=True)
@@ -3106,19 +3238,9 @@ def api_download():
     target_url = data["url"].strip()
     user_token = data["token"].strip()
 
-    # Validate the token with Jellyfin
-    try:
-        resp = requests.get(
-            f"{jellyfin_url()}/Users/Me",
-            headers={"Authorization": f'MediaBrowser Token="{user_token}"'},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        user_data = resp.json()
-        user_id = user_data["Id"]
-        username = user_data["Name"]
-    except Exception as e:
-        print(f"[api] Token validation failed: {e}", flush=True)
+    # Validate OUR opaque token, not a raw Jellyfin token.
+    user_id, username = validate_api_token(user_token)
+    if not user_id:
         return jsonify({"error": "Authentication failed"}), 401
 
     # Ensure the user exists locally
@@ -3128,7 +3250,8 @@ def api_download():
         ).fetchone()
         if not row:
             conn.execute(
-                "INSERT INTO users (user_id, username, is_admin) VALUES (?,?,0)",
+                "INSERT OR IGNORE INTO users (user_id, username, is_admin) "
+                "VALUES (?,?,0)",
                 (user_id, username),
             )
             threading.Thread(
@@ -3136,6 +3259,20 @@ def api_download():
                 args=(user_id, username),
                 daemon=True,
             ).start()
+
+    # Restrict API downloads to Jellyfin admins. Non-admin extension use
+    # requires maintaining an allowlist table instead.
+    try:
+        jf_user_id, _ = jellyfin_login(username, "__never_matches__")
+    except Exception:
+        pass
+    # Simpler path: check the local is_admin flag.
+    with db() as conn:
+        local = conn.execute(
+            "SELECT is_admin FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if not (local and local["is_admin"]):
+        return jsonify({"error": "Not authorized to queue downloads"}), 403
 
     # Determine type and queue download
     is_playlist_only = (
@@ -3149,11 +3286,8 @@ def api_download():
     url_type = "video" if is_single else "channel"
 
     print(f"[api] {username} queued {url_type}: {target_url}", flush=True)
-    threading.Thread(
-        target=run_download,
-        args=(user_id, target_url),
-        daemon=True,
-    ).start()
+    if not enqueue_download(user_id, target_url):
+        return jsonify({"error": "Download queue is full. Try again shortly."}), 503
 
     return jsonify({
         "status": "queued",
@@ -3164,8 +3298,8 @@ def api_download():
 
 if __name__ == "__main__":
     import logging
-    # Silence Werkzeug's per-request access log so `docker logs` stays
-    # readable. Errors and warnings still print.
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
-
-    app.run(host="0.0.0.0", port=6842)
+    # Production WSGI server. Requires `pip install waitress` at image
+    # build time.
+    from waitress import serve
+    serve(app, host="0.0.0.0", port=6842, threads=8)
