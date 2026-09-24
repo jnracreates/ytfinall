@@ -208,12 +208,13 @@ A companion browser extension lets you right-click any YouTube video, channel, o
 
 - **Microsoft Edge Add-ons** — [ytfinall Connector](https://microsoftedge.microsoft.com/addons/detail/ytfinall-connector/hdfpngaekagheekoajkjhdjoomppmlhj)
 - **Firefox Add-ons (AMO)** — pending review
-- **Chrome Web Store** — not available (extension download policy). See manual install below.
+- **Chrome** — manual install required (Chrome Web Store policy). See [INSTALL_CHROME.md](INSTALL_CHROME.md) for step-by-step instructions.
 
 **Works on:**
 - Microsoft Edge (desktop and mobile)
 - Firefox (desktop and Android — pending AMO approval)
 - Any Chromium browser that can install from the Edge Add-ons store
+- Chrome, via the manual install guide
 
 **Mobile note:** Right-click menus don't exist on mobile browsers. On mobile, tap the extension icon and paste the YouTube URL into the popup instead.
 
@@ -222,12 +223,6 @@ A companion browser extension lets you right-click any YouTube video, channel, o
 2. Right-click any YouTube link (or paste a URL on mobile)
 3. The URL is sent to your ytfinall server and queued for download
 4. The video appears in your Jellyfin library when the download completes
-
-### Chrome — manual install
-
-The Chrome Web Store does not accept extensions that facilitate YouTube downloads. To install manually:
-
-1. Clone the repository:
 
 ### Notes
 
