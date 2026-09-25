@@ -13,3 +13,4 @@ ytfinall-extension/store-assets/
 *.swp
 *.tmp
 .venv/
+app.py.before-*

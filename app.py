@@ -132,6 +132,19 @@ def safe_username(name):
     cleaned = cleaned.strip(". ")  # Windows dislikes trailing dots/spaces
     return cleaned or "user"
 
+
+def is_single_video_url(url):
+    """True if the URL is a single video (not a channel or playlist)."""
+    url = url or ""
+    is_playlist_only = (
+        "/playlist" in url
+        or ("list=" in url and "watch?v=" not in url and "youtu.be/" not in url)
+    )
+    return (
+        ("youtube.com/watch" in url or "youtu.be/" in url)
+        and not is_playlist_only
+    )
+
 os.makedirs("/app-data", exist_ok=True)
 os.makedirs(MEDIA_ROOT, exist_ok=True)
 os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -1370,6 +1383,20 @@ def run_download(user_id, url, custom_name=None, cutoff_date=None):
 
 def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
     ensure_ytdlp_updated()
+
+    # Find the source row this download belongs to, so its files can be
+    # tagged with it and governed by that source's retention later.
+    try:
+        with db() as _c:
+            _sr = _c.execute(
+                "SELECT id FROM sources WHERE user_id=? AND url=? "
+                "ORDER BY id DESC LIMIT 1",
+                (user_id, url),
+            ).fetchone()
+        source_id = _sr["id"] if _sr else None
+    except Exception as _e:
+        print(f"[retention] source lookup failed: {_e}", flush=True)
+        source_id = None
     cmd, staging_dir = build_ytdlp_cmd(user_id, url, custom_name, cutoff_date)
     print(f"[download] starting {url} for user {user_id}", flush=True)
 
@@ -1491,6 +1518,18 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
 
     if success:
         os.makedirs(final_root, exist_ok=True)
+
+        # Gather the media file paths in staging BEFORE the move, so we
+        # can write a retention marker next to each one after it lands.
+        _media_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
+                       ".mp3", ".m4a", ".flac", ".opus", ".ogg"}
+        _staged_paths = []
+        for _wr, _, _wf in os.walk(staging_dir):
+            for _n in _wf:
+                if os.path.splitext(_n)[1].lower() in _media_exts:
+                    _src_path = os.path.join(_wr, _n)
+                    _rel = os.path.relpath(_src_path, staging_dir)
+                    _staged_paths.append(os.path.join(final_root, _rel))
         try:
             write_all_episode_nfos(staging_dir)
             fix_one_off_nfo(staging_dir)
@@ -1500,6 +1539,21 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
             print(f"[download] move error: {e}", flush=True)
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
+
+        # Tag each freshly-moved file with the source it came from, so
+        # cleanup can apply this source's retention to it later.
+        if source_id is not None:
+            import json as _json
+            for _dst in _staged_paths:
+                if not os.path.exists(_dst):
+                    continue
+                _marker = _dst + ".ytfinall.json"
+                try:
+                    with open(_marker, "w") as _mf:
+                        _json.dump({"source_id": source_id}, _mf)
+                except OSError as _me:
+                    print(f"[retention] marker write failed for "
+                          f"{_dst}: {_me}", flush=True)
 
         # Trim long YouTube descriptions to a short synopsis
         try:
@@ -1574,10 +1628,34 @@ def cleanup_empty_folders(user_root):
                 print(f"[cleanup] could not remove {path}: {e}", flush=True)
 
 
-def cleanup_user_media(user_id, retention_days):
+def cleanup_user_media(user_id, fallback_retention_days):
+    """Delete files past their retention window.
+
+    Each video carries a sidecar marker (.ytfinall.json) recording the
+    source that produced it. Cleanup looks up that source's CURRENT
+    retention and applies it to the file. Files with no marker (or whose
+    source was deleted) fall back to the user's minimum source retention,
+    or the admin cap if the user has no sources left.
+    """
+    import json as _json
+
     cap = max_retention_days()
-    retention_days = min(max(1, int(retention_days or cap)), cap)
-    cutoff = time.time() - (retention_days * 86400)
+
+    with db() as conn:
+        source_rows = conn.execute(
+            "SELECT id, retention_days FROM sources WHERE user_id=?",
+            (user_id,),
+        ).fetchall()
+    source_retention = {
+        row["id"]: min(max(1, int(row["retention_days"] or cap)), cap)
+        for row in source_rows
+    }
+    if source_retention:
+        fallback = min(source_retention.values())
+    else:
+        fallback = min(max(1, int(fallback_retention_days or cap)), cap)
+    now = time.time()
+    marker_suffix = ".ytfinall.json"
     with db() as conn:
         row = conn.execute(
             "SELECT username FROM users WHERE user_id=?", (user_id,)
@@ -1590,8 +1668,22 @@ def cleanup_user_media(user_id, retention_days):
         for name in files:
             path = os.path.join(root, name)
             try:
-                if os.path.getmtime(path) < cutoff:
+                _mp = path + marker_suffix
+                _retention = fallback
+                try:
+                    with open(_mp) as _mf:
+                        _d = _json.load(_mf)
+                    _sid = _d.get("source_id")
+                    if _sid is not None and _sid in source_retention:
+                        _retention = source_retention[_sid]
+                except (OSError, ValueError):
+                    pass
+                if os.path.getmtime(path) < (now - _retention * 86400):
                     os.remove(path)
+                    try:
+                        os.remove(_mp)
+                    except OSError:
+                        pass
             except OSError:
                 pass
 
@@ -1631,7 +1723,7 @@ def scheduler_loop():
             try:
                 with db() as conn:
                     rows = conn.execute(
-                        "SELECT DISTINCT user_id, retention_days FROM sources"
+                        "SELECT user_id FROM users"
                     ).fetchall()
                 for row in rows:
                     cleanup_user_media(row["user_id"], row["retention_days"])
@@ -1649,62 +1741,353 @@ threading.Thread(target=scheduler_loop, daemon=True).start()
 # Templates
 # ------------------------------------------------------------------
 BASE_CSS = """
-*{box-sizing:border-box}
-body{font-family:sans-serif;max-width:760px;margin:0 auto;padding:16px;color:#222;-webkit-text-size-adjust:100%}
-h2{margin-bottom:0.3em;font-size:1.5em}
-h3{font-size:1.2em;margin-top:1.5em}
-input,select{width:100%;padding:12px;margin:6px 0 14px;font-size:16px;border:1px solid #ccc;border-radius:4px}
-button{padding:12px 22px;background:#00a4dc;color:#fff;border:none;cursor:pointer;font-size:16px;border-radius:4px}
-button:hover{background:#0088b8}
-.error{color:#c00;background:#fee;padding:10px;border-radius:4px}
-.ok{color:#0a5;background:#e7f8ee;padding:10px;border-radius:4px}
-table{width:100%;border-collapse:collapse;margin-top:14px;font-size:14px}
-td,th{padding:8px;border-bottom:1px solid #ddd;text-align:left}
-.small{color:#666;font-size:0.9em}
-.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
-label{display:block;font-weight:600;margin-top:6px}
-.card{background:#f7f9fb;border:1px solid #e1e6eb;border-radius:6px;padding:14px 18px;margin:18px 0}
-a{color:#00a4dc;text-decoration:none}
-a:hover{text-decoration:underline}
-.logo{display:block;max-width:220px;margin:0 auto 20px;height:auto}
-.logo-sm{max-width:150px;margin:0;height:auto}
+:root{
+  --bg:#f6f8fb;
+  --surface:#ffffff;
+  --surface-2:#f1f4f8;
+  --surface-3:#e9eef4;
+  --border:#e3e8ee;
+  --border-strong:#cbd3dc;
+  --text:#14181d;
+  --text-muted:#5b6573;
+  --text-faint:#8b95a3;
+  --accent:#00a4dc;
+  --accent-hover:#008fc2;
+  --accent-soft:#e6f6fd;
+  --success:#0a8f5a;
+  --success-soft:#e3f7ee;
+  --danger:#c8384a;
+  --danger-soft:#fdecee;
+  --shadow-sm:0 1px 2px rgba(15,23,42,.04);
+  --shadow:0 1px 3px rgba(15,23,42,.06),0 4px 14px rgba(15,23,42,.05);
+  --shadow-lg:0 8px 24px rgba(15,23,42,.08),0 2px 6px rgba(15,23,42,.05);
+  --radius:10px;
+  --radius-sm:6px;
+  --radius-lg:16px;
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Inter","Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",Monaco,"Cascadia Code",Consolas,monospace;
+}
 
-/* Info Tooltip Styles */
-.input-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
-.input-row input, .input-row select { margin: 0; flex-grow: 1; }
-.info-btn { background: #555; color: #fff; border: none; cursor: pointer; padding: 10px 14px; font-size: 15px; border-radius: 4px; font-weight: bold; white-space: nowrap; transition: background 0.2s; }
-.info-btn:hover { background: #333; }
-.info-toggle { display: none; }
-.info-toggle:checked ~ .info-box { display: block; }
-.info-box { display: none; background: #f0f4f8; border-left: 4px solid #00a4dc; padding: 12px 16px; margin: 8px 0 16px 0; border-radius: 0 4px 4px 0; font-size: 14px; color: #333; line-height: 1.5; }
-.info-box ul { margin: 6px 0 0 0; padding-left: 20px; }
-.info-box li { margin-bottom: 4px; }
-.field-group { margin-bottom: 14px; }
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0e1116;
+    --surface:#161a21;
+    --surface-2:#1c212a;
+    --surface-3:#232a35;
+    --border:#242b36;
+    --border-strong:#39424f;
+    --text:#e8ebef;
+    --text-muted:#98a1ad;
+    --text-faint:#6a7382;
+    --accent:#4cb8e6;
+    --accent-hover:#6cc8ef;
+    --accent-soft:#0e2d3f;
+    --success:#34d399;
+    --success-soft:#0d2c22;
+    --danger:#f47b8a;
+    --danger-soft:#3a181e;
+    --shadow-sm:0 1px 2px rgba(0,0,0,.35);
+    --shadow:0 1px 3px rgba(0,0,0,.4),0 4px 14px rgba(0,0,0,.3);
+    --shadow-lg:0 8px 24px rgba(0,0,0,.5),0 2px 6px rgba(0,0,0,.35);
+  }
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  font-family:var(--font);
+  background:var(--bg);
+  color:var(--text);
+  max-width:820px;
+  margin:0 auto;
+  padding:28px 20px 60px;
+  line-height:1.55;
+  font-size:15.5px;
+  -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
+}
+
+h2{font-size:1.55rem;font-weight:650;letter-spacing:-.015em;margin:0 0 .35em}
+h3{font-size:1.05rem;font-weight:650;letter-spacing:-.01em;margin:1.8em 0 .5em}
+p{margin:.5em 0}
+
+label{
+  display:block;
+  font-weight:600;
+  font-size:.88rem;
+  color:var(--text);
+  margin:0 0 6px;
+  letter-spacing:-.005em;
+}
+
+input,select,textarea{
+  width:100%;
+  padding:11px 13px;
+  margin:0 0 4px;
+  font-size:15px;
+  font-family:inherit;
+  color:var(--text);
+  background:var(--surface);
+  border:1px solid var(--border-strong);
+  border-radius:var(--radius-sm);
+  transition:border-color .15s ease,box-shadow .15s ease,background .15s ease;
+  appearance:none;
+}
+input:focus,select:focus,textarea:focus{
+  outline:none;
+  border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-soft);
+}
+input::placeholder{color:var(--text-faint)}
+input:disabled{background:var(--surface-2);color:var(--text-muted);cursor:not-allowed}
+
+select{
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%238b95a3' d='M6 8 0 0h12z'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;
+  background-position:right 14px center;
+  padding-right:36px;
+}
+
+button{
+  padding:11px 20px;
+  background:var(--accent);
+  color:#fff;
+  border:none;
+  border-radius:var(--radius-sm);
+  cursor:pointer;
+  font-size:14.5px;
+  font-weight:600;
+  font-family:inherit;
+  letter-spacing:-.005em;
+  transition:background .15s ease,transform .06s ease,box-shadow .15s ease;
+  box-shadow:var(--shadow-sm);
+}
+button:hover{background:var(--accent-hover)}
+button:active{transform:translateY(1px)}
+button:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-soft)}
+button:disabled{opacity:.55;cursor:not-allowed}
+
+a{color:var(--accent);text-decoration:none;font-weight:500}
+a:hover{text-decoration:underline}
+
+.small{color:var(--text-muted);font-size:.86rem}
+.error{
+  color:var(--danger);
+  background:var(--danger-soft);
+  padding:11px 14px;
+  border-radius:var(--radius-sm);
+  border:1px solid color-mix(in srgb,var(--danger) 25%,transparent);
+  font-size:.9rem;
+}
+.ok{
+  color:var(--success);
+  background:var(--success-soft);
+  padding:11px 14px;
+  border-radius:var(--radius-sm);
+  border:1px solid color-mix(in srgb,var(--success) 25%,transparent);
+  font-size:.9rem;
+}
+
+.header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:12px;
+  padding-bottom:18px;
+  margin-bottom:22px;
+  border-bottom:1px solid var(--border);
+}
+
+.card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  padding:18px 22px;
+  margin:18px 0;
+  box-shadow:var(--shadow-sm);
+}
+
+table{
+  width:100%;
+  border-collapse:separate;
+  border-spacing:0;
+  margin-top:14px;
+  font-size:.92rem;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  overflow:hidden;
+}
+th{
+  padding:11px 14px;
+  text-align:left;
+  font-weight:600;
+  font-size:.78rem;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  color:var(--text-muted);
+  background:var(--surface-2);
+  border-bottom:1px solid var(--border);
+}
+td{
+  padding:12px 14px;
+  border-bottom:1px solid var(--border);
+  vertical-align:middle;
+}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--surface-2)}
+
+.logo{
+  display:block;
+  max-width:200px;
+  margin:12px auto 24px;
+  height:auto;
+}
+.logo-sm{max-width:130px;margin:0;height:auto}
+
+/* Info tooltip pattern */
+.field-group{margin-bottom:18px}
+.input-row{display:flex;align-items:stretch;gap:8px;margin-top:6px}
+.input-row input,.input-row select{margin:0;flex-grow:1}
+.info-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  background:transparent;
+  color:var(--accent);
+  border:none;
+  cursor:pointer;
+  padding:0 8px;
+  font-size:20px;
+  line-height:1;
+  border-radius:0;
+  white-space:nowrap;
+  user-select:none;
+  transition:color .15s ease,transform .1s ease;
+  box-shadow:none;
+  flex-shrink:0;
+}
+.info-btn:hover{color:var(--accent-hover);transform:scale(1.12)}
+.info-btn-wide{
+  padding:9px 18px;
+  border:1px solid var(--border-strong);
+  border-radius:var(--radius-sm);
+  font-size:13px;
+  font-weight:600;
+  color:var(--text-muted);
+  background:var(--surface-2);
+}
+.info-btn-wide:hover{
+  background:var(--surface-3);
+  color:var(--text);
+  border-color:var(--border-strong);
+  transform:none;
+}
+.info-toggle{display:none}
+.info-toggle:checked ~ .info-box{display:block}
+.info-box{
+  display:none;
+  background:var(--accent-soft);
+  border-left:3px solid var(--accent);
+  padding:13px 16px;
+  margin:10px 0 16px;
+  border-radius:0 var(--radius-sm) var(--radius-sm) 0;
+  font-size:.88rem;
+  color:var(--text);
+  line-height:1.55;
+}
+.info-box ul{margin:6px 0 0;padding-left:20px}
+.info-box li{margin-bottom:4px}
+.info-box code{
+  background:rgba(0,0,0,.06);
+  padding:1px 6px;
+  border-radius:4px;
+  font-family:var(--mono);
+  font-size:.85em;
+}
+@media (prefers-color-scheme: dark){
+  .info-box code{background:rgba(255,255,255,.08)}
+}
 
 /* Donation footer */
-.donate-footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #e1e6eb; text-align: center; }
-.donate-message { font-size: 14px; color: #444; margin-bottom: 12px; font-style: italic; }
-.donate-title { font-size: 13px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
-.donate-links { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
-.donate-link { display: inline-block; padding: 8px 16px; background: #f7f9fb; border: 1px solid #e1e6eb; border-radius: 6px; color: #00a4dc; font-size: 14px; font-weight: 600; text-decoration: none; transition: background 0.15s, border-color 0.15s; }
-.donate-link:hover { background: #e3f2fd; border-color: #00a4dc; text-decoration: none; }
+.donate-footer{
+  margin-top:48px;
+  padding-top:26px;
+  border-top:1px solid var(--border);
+  text-align:center;
+}
+.donate-message{
+  font-size:.9rem;
+  color:var(--text-muted);
+  margin-bottom:14px;
+  font-style:italic;
+}
+.donate-title{
+  font-size:.75rem;
+  color:var(--text-faint);
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  margin-bottom:12px;
+  font-weight:600;
+}
+.donate-links{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
+.donate-link{
+  display:inline-block;
+  padding:9px 18px;
+  background:var(--surface);
+  border:1px solid var(--border-strong);
+  border-radius:var(--radius-sm);
+  color:var(--text);
+  font-size:.88rem;
+  font-weight:600;
+  text-decoration:none;
+  transition:background .15s ease,border-color .15s ease,transform .06s ease;
+  box-shadow:var(--shadow-sm);
+}
+.donate-link:hover{
+  background:var(--accent-soft);
+  border-color:var(--accent);
+  color:var(--accent);
+  text-decoration:none;
+  transform:translateY(-1px);
+}
 
-/* Mobile responsive */
-@media (max-width: 600px) {
-  body { padding: 12px; margin: 0; }
-  h2 { font-size: 1.3em; }
-  h3 { font-size: 1.1em; }
-  .logo { max-width: 160px; }
-  .logo-sm { max-width: 120px; }
-  .input-row { flex-wrap: wrap; }
-  .input-row input, .input-row select { width: 100%; }
-  .info-btn { width: 100%; text-align: center; padding: 8px; }
-  table { font-size: 13px; }
-  td,th { padding: 6px; }
-  .header { flex-direction: column; align-items: flex-start; gap: 6px; }
-  .header > div { width: 100%; }
-  .donate-links { flex-direction: column; }
-  .donate-link { width: 100%; text-align: center; }
+/* Task cards (dashboard) */
+.task{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  padding:14px 18px;
+  margin:10px 0;
+  box-shadow:var(--shadow-sm);
+}
+.task-url{font-size:.78rem;color:var(--text-muted);word-break:break-all;margin-bottom:6px;font-family:var(--mono)}
+.task-msg{font-size:.9rem;color:var(--text);margin-bottom:8px;font-weight:500}
+.task-bar{background:var(--surface-3);height:8px;border-radius:999px;overflow:hidden}
+.task-fill{background:var(--accent);height:100%;width:0%;transition:width .35s ease;border-radius:999px}
+.task.complete .task-fill{background:var(--success)}
+.task.failed .task-fill{background:var(--danger)}
+.task-eta{font-size:.8rem;color:var(--text-muted);margin-top:6px}
+
+/* Mobile */
+@media (max-width:600px){
+  body{padding:16px 14px 40px;font-size:15px}
+  h2{font-size:1.3rem}
+  h3{font-size:1rem}
+  .logo{max-width:150px;margin:6px auto 18px}
+  .logo-sm{max-width:110px}
+  .input-row{flex-wrap:wrap}
+  .input-row input,.input-row select{width:100%}
+  .info-btn{padding:0 6px;font-size:20px}
+  .info-btn-wide{width:100%;padding:10px;font-size:13px}
+  table{font-size:.85rem}
+  th,td{padding:9px 10px}
+  .header{flex-direction:column;align-items:flex-start;gap:8px}
+  .header>div{width:100%}
+  .donate-links{flex-direction:column}
+  .donate-link{width:100%;text-align:center}
+  .card{padding:14px 16px}
 }
 """
 
@@ -1738,8 +2121,8 @@ SETUP_PAGE = """
 .field-group { margin-bottom: 14px; }
 .input-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .input-row input { margin: 0 !important; flex-grow: 1; width: 100%; box-sizing: border-box; }
-.info-btn { background: #555; color: #fff; border: none; cursor: pointer; padding: 10px 14px; font-size: 15px; border-radius: 4px; font-weight: bold; white-space: nowrap; transition: background 0.2s; display: inline-block; text-align: center; line-height: 1.2; }
-.info-btn:hover { background: #333; }
+.info-btn { background: transparent; color: #00a4dc; border: none; cursor: pointer; padding: 0 8px; font-size: 20px; line-height: 1; white-space: nowrap; transition: color .15s ease, transform .1s ease; display: inline-flex; align-items: center; justify-content: center; text-align: center; flex-shrink: 0; }
+.info-btn:hover { color: #008fc2; transform: scale(1.12); }
 .info-toggle { display: none; }
 .info-toggle:checked ~ .info-box { display: block; }
 .info-box { display: none; background: #f0f4f8; border-left: 4px solid #00a4dc; padding: 12px 16px; margin: 8px 0 16px 0; border-radius: 0 4px 4px 0; font-size: 14px; color: #333; line-height: 1.5; box-sizing: border-box; }
@@ -1752,7 +2135,7 @@ SETUP_PAGE = """
     <label>Jellyfin URL (as seen from inside the container)</label>
     <div class="input-row">
       <input name="jellyfin_url" value="{{ jf_url }}" required>
-      <label for="setup-url" class="info-btn">ⓘ Info</label>
+      <label for="setup-url" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="setup-url" class="info-toggle">
     <div class="info-box">
@@ -1768,7 +2151,7 @@ SETUP_PAGE = """
     <label>Jellyfin API key</label>
     <div class="input-row">
       <input name="jellyfin_api_key" placeholder="Paste the key from Jellyfin → Dashboard → API Keys" required>
-      <label for="setup-key" class="info-btn">ⓘ Info</label>
+      <label for="setup-key" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="setup-key" class="info-toggle">
     <div class="info-box">
@@ -1780,7 +2163,7 @@ SETUP_PAGE = """
     <label>Maximum download lookback (days)</label>
     <div class="input-row">
       <input name="max_lookback_days" type="number" min="1" max="3650" value="{{ max_lookback }}" required>
-      <label for="setup-lookback" class="info-btn">ⓘ Info</label>
+      <label for="setup-lookback" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="setup-lookback" class="info-toggle">
     <div class="info-box">
@@ -1792,7 +2175,7 @@ SETUP_PAGE = """
     <label>Maximum retention (days)</label>
     <div class="input-row">
       <input name="max_retention_days" type="number" min="1" max="3650" value="{{ max_retention }}" required>
-      <label for="setup-retention" class="info-btn">ⓘ Info</label>
+      <label for="setup-retention" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="setup-retention" class="info-toggle">
     <div class="info-box">
@@ -1827,16 +2210,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
   <div id="tasks-list"></div>
 </div>
 
-<style>
-  .task { background: #f7f9fb; border: 1px solid #e1e6eb; border-radius: 6px; padding: 12px 16px; margin: 10px 0; }
-  .task-url { font-size: 12px; color: #666; word-break: break-all; margin-bottom: 6px; }
-  .task-msg { font-size: 13px; color: #333; margin-bottom: 6px; }
-  .task-bar { background: #e1e6eb; height: 18px; border-radius: 4px; overflow: hidden; }
-  .task-fill { background: #00a4dc; height: 100%; width: 0%; transition: width 0.3s ease; }
-  .task.complete .task-fill { background: #0a5; }
-  .task.failed .task-fill { background: #c33; }
-  .task-eta { font-size: 12px; color: #666; margin-top: 4px; }
-</style>
+
 
 <h3>Add a one-off video</h3>
 <form method="post" action="/add">
@@ -1844,7 +2218,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
     <label>Video URL</label>
     <div class="input-row">
       <input name="url" required placeholder="https://www.youtube.com/watch?v=...">
-      <label for="info-oneoff" class="info-btn">ⓘ Info</label>
+      <label for="info-oneoff" class="info-btn">ⓘ</label>
     </div>
     <p class="small" style="margin-top:6px">Paste a single video URL. It goes into a shared <strong>One-Off Videos</strong> folder in your library.</p>
     <input type="checkbox" id="info-oneoff" class="info-toggle">
@@ -1858,7 +2232,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
     <label>Retention period (1–{{ max_retention }} days)</label>
     <div class="input-row">
       <input name="retention" type="number" min="1" max="{{ max_retention }}" value="{{ max_retention }}">
-      <label for="info-oneoff-ret" class="info-btn">ⓘ Info</label>
+      <label for="info-oneoff-ret" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="info-oneoff-ret" class="info-toggle">
     <div class="info-box">
@@ -1875,7 +2249,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
     <label>Source URL</label>
     <div class="input-row">
       <input name="url" required placeholder="https://youtube.com">
-      <label for="info-url" class="info-btn">ⓘ Info</label>
+      <label for="info-url" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="info-url" class="info-toggle">
     <div class="info-box">
@@ -1891,7 +2265,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
     <label>Custom Name (optional)</label>
     <div class="input-row">
       <input name="name" placeholder="Leave blank to use the channel's name">
-      <label for="info-name" class="info-btn">ⓘ Info</label>
+      <label for="info-name" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="info-name" class="info-toggle">
     <div class="info-box">
@@ -1903,7 +2277,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
     <label>Download Cutoff Date (optional)</label>
     <div class="input-row">
       <input name="cutoff" type="date">
-      <label for="info-cutoff" class="info-btn">ⓘ Info</label>
+      <label for="info-cutoff" class="info-btn">ⓘ</label>
     </div>
     <p class="small" style="margin-top:6px">Leave blank to download the last <strong>7 days</strong>.</p>
     <input type="checkbox" id="info-cutoff" class="info-toggle">
@@ -1921,7 +2295,7 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
     <label>Retention period (1–{{ max_retention }} days)</label>
     <div class="input-row">
       <input name="retention" type="number" min="1" max="{{ max_retention }}" value="{{ max_retention }}">
-      <label for="info-retention" class="info-btn">ⓘ Info</label>
+      <label for="info-retention" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="info-retention" class="info-toggle">
     <div class="info-box">
@@ -1935,10 +2309,10 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 <h3>Your sources</h3>
 <div style="overflow-x:auto">
 <table>
-<tr><th>Name</th><th>URL</th><th>Cutoff</th><th>Retention</th><th></th></tr>
+<tr><th>Added</th><th>URL</th><th>Cutoff</th><th>Retention</th><th></th></tr>
 {% for s in sources %}
 <tr>
-  <td>{{ s.name or "—" }}</td>
+  <td>{{ s.created_at[:10] if s.created_at else "—" }}</td>
   <td>{{ s.url }}</td>
   <td>{{ s.cutoff or "Last 7 days" }}</td>
   <td>{{ s.retention_days }} days</td>
@@ -2110,7 +2484,7 @@ SETTINGS_PAGE = """
       <label>Jellyfin URL</label>
       <div class="input-row">
         <input name="jellyfin_url" value="{{ jf_url }}" required>
-        <label for="settings-url" class="info-btn">ⓘ Info</label>
+        <label for="settings-url" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-url" class="info-toggle">
       <div class="info-box">
@@ -2126,7 +2500,7 @@ SETTINGS_PAGE = """
       <label>Jellyfin API key</label>
       <div class="input-row">
         <input name="jellyfin_api_key" value="{{ api_key }}" required>
-        <label for="settings-key" class="info-btn">ⓘ Info</label>
+        <label for="settings-key" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-key" class="info-toggle">
       <div class="info-box">
@@ -2138,7 +2512,7 @@ SETTINGS_PAGE = """
       <label>Maximum download lookback (days)</label>
       <div class="input-row">
         <input name="max_lookback_days" type="number" min="1" max="3650" value="{{ max_lookback }}" required>
-        <label for="settings-lookback" class="info-btn">ⓘ Info</label>
+        <label for="settings-lookback" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-lookback" class="info-toggle">
       <div class="info-box">
@@ -2150,7 +2524,7 @@ SETTINGS_PAGE = """
       <label>Maximum retention (days)</label>
       <div class="input-row">
         <input name="max_retention_days" type="number" min="1" max="3650" value="{{ max_retention }}" required>
-        <label for="settings-retention" class="info-btn">ⓘ Info</label>
+        <label for="settings-retention" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-retention" class="info-toggle">
       <div class="info-box">
@@ -2165,7 +2539,7 @@ SETTINGS_PAGE = """
       <label>Playlist scan limit (items per channel)</label>
       <div class="input-row">
         <input name="playlist_end" type="number" min="1" max="500" value="{{ playlist_end }}" required>
-        <label for="settings-playlist" class="info-btn">ⓘ Info</label>
+        <label for="settings-playlist" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-playlist" class="info-toggle">
       <div class="info-box">
@@ -2181,7 +2555,7 @@ SETTINGS_PAGE = """
       <label>Sleep between requests (seconds)</label>
       <div class="input-row">
         <input name="sleep_requests" type="number" min="0" max="60" value="{{ sleep_requests }}" required>
-        <label for="settings-sleepreq" class="info-btn">ⓘ Info</label>
+        <label for="settings-sleepreq" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-sleepreq" class="info-toggle">
       <div class="info-box">
@@ -2193,7 +2567,7 @@ SETTINGS_PAGE = """
       <label>Minimum sleep between videos (seconds)</label>
       <div class="input-row">
         <input name="sleep_interval" type="number" min="0" max="600" value="{{ sleep_interval }}" required>
-        <label for="settings-sleepmin" class="info-btn">ⓘ Info</label>
+        <label for="settings-sleepmin" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-sleepmin" class="info-toggle">
       <div class="info-box">
@@ -2205,7 +2579,7 @@ SETTINGS_PAGE = """
       <label>Maximum sleep between videos (seconds)</label>
       <div class="input-row">
         <input name="max_sleep_interval" type="number" min="0" max="600" value="{{ max_sleep_interval }}" required>
-        <label for="settings-sleepmax" class="info-btn">ⓘ Info</label>
+        <label for="settings-sleepmax" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-sleepmax" class="info-toggle">
       <div class="info-box">
@@ -2217,7 +2591,7 @@ SETTINGS_PAGE = """
       <label>Maximum resolution (vertical pixels)</label>
       <div class="input-row">
         <input name="max_resolution" type="number" min="144" max="4320" value="{{ max_resolution }}" required>
-        <label for="settings-res" class="info-btn">ⓘ Info</label>
+        <label for="settings-res" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-res" class="info-toggle">
       <div class="info-box">
@@ -2229,7 +2603,7 @@ SETTINGS_PAGE = """
       <label>Media container</label>
       <div class="input-row">
         <input name="media_container" value="{{ media_container }}" required>
-        <label for="settings-container" class="info-btn">ⓘ Info</label>
+        <label for="settings-container" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-container" class="info-toggle">
       <div class="info-box">
@@ -2241,7 +2615,7 @@ SETTINGS_PAGE = """
       <label>Output template (yt-dlp <code>-o</code> syntax)</label>
       <div class="input-row">
         <input name="outtmpl" value="{{ outtmpl }}" required>
-        <label for="settings-outtmpl" class="info-btn">ⓘ Info</label>
+        <label for="settings-outtmpl" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-outtmpl" class="info-toggle">
       <div class="info-box">
@@ -2258,7 +2632,7 @@ SETTINGS_PAGE = """
       <label>Extra yt-dlp arguments (space-separated)</label>
       <div class="input-row">
         <input name="extra_ytdlp_args" value="{{ extra_ytdlp_args }}" placeholder="e.g. --geo-bypass --no-check-certificates">
-        <label for="settings-extra" class="info-btn">ⓘ Info</label>
+        <label for="settings-extra" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-extra" class="info-toggle">
       <div class="info-box">
@@ -2270,7 +2644,7 @@ SETTINGS_PAGE = """
       <label>Index interval (hours)</label>
       <div class="input-row">
         <input name="index_interval_hours" type="number" min="1" max="720" value="{{ index_interval_hours }}" required>
-        <label for="settings-index" class="info-btn">ⓘ Info</label>
+        <label for="settings-index" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-index" class="info-toggle">
       <div class="info-box">
@@ -2282,7 +2656,7 @@ SETTINGS_PAGE = """
       <label>Cleanup interval (hours)</label>
       <div class="input-row">
         <input name="cleanup_interval_hours" type="number" min="1" max="720" value="{{ cleanup_interval_hours }}" required>
-        <label for="settings-cleanup" class="info-btn">ⓘ Info</label>
+        <label for="settings-cleanup" class="info-btn">ⓘ</label>
       </div>
       <input type="checkbox" id="settings-cleanup" class="info-toggle">
       <div class="info-box">
@@ -2597,7 +2971,7 @@ EDIT_PAGE = """
     <label>Custom Name (optional)</label>
     <div class="input-row">
       <input name="name" value="{{ s.name or '' }}" placeholder="Leave blank to use the channel's name">
-      <label for="edit-name" class="info-btn">ⓘ Info</label>
+      <label for="edit-name" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="edit-name" class="info-toggle">
     <div class="info-box">
@@ -2609,7 +2983,7 @@ EDIT_PAGE = """
     <label>Download Cutoff Date (optional)</label>
     <div class="input-row">
       <input name="cutoff" type="date" value="{{ s.cutoff or '' }}">
-      <label for="edit-cutoff" class="info-btn">ⓘ Info</label>
+      <label for="edit-cutoff" class="info-btn">ⓘ</label>
     </div>
     <p class="small" style="margin-top:6px">Leave blank to download the last <strong>7 days</strong>.</p>
     <input type="checkbox" id="edit-cutoff" class="info-toggle">
@@ -2627,7 +3001,7 @@ EDIT_PAGE = """
     <label>Retention period (1–{{ max_retention }} days)</label>
     <div class="input-row">
       <input name="retention" type="number" min="1" max="{{ max_retention }}" value="{{ s.retention_days }}">
-      <label for="edit-retention" class="info-btn">ⓘ Info</label>
+      <label for="edit-retention" class="info-btn">ⓘ</label>
     </div>
     <input type="checkbox" id="edit-retention" class="info-toggle">
     <div class="info-box">
@@ -2724,7 +3098,7 @@ def index():
         DASHBOARD,
         css=BASE_CSS,
         username=session.get("username", "User"),
-        sources=sources,
+        sources=[s for s in sources if not is_single_video_url(s["url"])],
         is_admin=session.get("is_admin", False),
         max_lookback=max_lookback_days(),
         max_retention=max_retention_days(),
