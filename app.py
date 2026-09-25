@@ -160,6 +160,25 @@ try:
 except Exception as _e:
     print(f"[startup] staging cleanup error: {_e}")
 
+# On startup, any download_task that isn't in a terminal state is
+# orphaned — the process that was running it no longer exists. Mark
+# them failed with a clear message so the user can clear them from
+# the dashboard instead of seeing ghost "active" entries.
+try:
+    with db() as _conn:
+        _cur = _conn.execute(
+            "UPDATE download_tasks SET status='failed', "
+            "message='Interrupted by server restart', "
+            "finished_at=? "
+            "WHERE status NOT IN ('complete', 'failed')",
+            (_now_iso(),),
+        )
+        if _cur.rowcount:
+            print(f"[startup] cleared {_cur.rowcount} orphaned task(s)",
+                  flush=True)
+except Exception as _e:
+    print(f"[startup] task cleanup error: {_e}")
+
 # Persist the Flask session secret so logins survive restarts.
 _secret_path = "/app-data/secret.key"
 if os.path.exists(_secret_path):
@@ -242,6 +261,20 @@ def init_db():
                 finished_at TEXT
             )
         """)
+        # Any task not in a terminal state at startup is orphaned —
+        # the process that owned it is gone. Mark them failed so the
+        # dashboard doesn't show ghost "active" entries.
+        _startup_now = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+        _cur = conn.execute(
+            "UPDATE download_tasks SET status='failed', "
+            "message='Interrupted by server restart', "
+            "finished_at=? "
+            "WHERE status NOT IN ('complete', 'failed')",
+            (_startup_now,),
+        )
+        if _cur.rowcount:
+            print(f"[startup] cleared {_cur.rowcount} orphaned task(s)",
+                  flush=True)
 
 
 init_db()
