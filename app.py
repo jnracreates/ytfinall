@@ -489,6 +489,234 @@ def build_user_list():
 
 
 # ------------------------------------------------------------------
+# YouTube search — find videos/channels without downloading
+# ------------------------------------------------------------------
+import json as _json
+import urllib.parse as _urlparse
+
+_search_cache = {}                 # key -> (expires_at, payload)
+_search_cache_lock = threading.Lock()
+_SEARCH_TTL = 300                  # seconds
+
+
+def _fmt_duration(seconds):
+    if not seconds:
+        return ""
+    s = int(seconds)
+    if s < 3600:
+        return f"{s // 60}:{s % 60:02d}"
+    return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def _search_videos(query, limit=15):
+    """yt-dlp ytsearch in flat-playlist mode. No download, no resolve."""
+    cmd = [
+        "yt-dlp", f"ytsearch{limit}:{query}",
+        "--flat-playlist", "--dump-json",
+        "--no-warnings", "--skip-download",
+        "--extractor-args",
+        "youtube:player_client=android,web_embedded,-visionos",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        print(f"[search] ytsearch timeout for {query!r}", flush=True)
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = _json.loads(line)
+        except ValueError:
+            continue
+        vid = d.get("id") or ""
+        url = d.get("url") or ""
+        if url and not url.startswith("http") and vid:
+            url = f"https://www.youtube.com/watch?v={vid}"
+        thumb = d.get("thumbnail")
+        thumbs = d.get("thumbnails") or []
+        if not thumb and thumbs:
+            thumb = thumbs[-1].get("url")
+        out.append({
+            "kind": "video",
+            "id": vid,
+            "url": url,
+            "title": d.get("title") or "",
+            "channel": d.get("channel") or d.get("uploader") or "",
+            "channel_id": d.get("channel_id") or d.get("uploader_id") or "",
+            "duration_human": _fmt_duration(d.get("duration")),
+            "thumbnail": thumb,
+            "live": bool(d.get("is_live")),
+        })
+    return out
+
+
+def _search_channels(query, limit=12):
+    """Scrape YouTube's channel search results. No API key needed."""
+    url = (
+        "https://www.youtube.com/results?search_query="
+        + _urlparse.quote(query)
+        + "&sp=EgIQAg%253D%253D"   # "Channels" filter
+    )
+    try:
+        r = subprocess.run(
+            ["curl", "-sL", "--max-time", "20",
+             "-H", "Accept-Language: en-US,en;q=0.9",
+             url],
+            capture_output=True, text=True, timeout=25,
+        )
+    except Exception as e:
+        print(f"[search] channel curl error: {e}", flush=True)
+        return []
+    if r.returncode != 0 or not r.stdout:
+        return []
+
+    m = re.search(r"var ytInitialData\s*=\s*(\{.+?\});</script>", r.stdout)
+    if not m:
+        return []
+    try:
+        data = _json.loads(m.group(1))
+    except ValueError:
+        return []
+
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "channelRenderer" in node:
+                found.append(node["channelRenderer"])
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(data)
+
+    out = []
+    for ch in found[:limit]:
+        try:
+            cid = ch.get("channelId") or ""
+            if not cid:
+                continue
+            title = (ch.get("title") or {}).get("simpleText") or ""
+            if not title:
+                runs = (ch.get("title") or {}).get("runs") or []
+                title = "".join(r.get("text", "") for r in runs)
+            subs = (ch.get("videoCountText") or {}).get("simpleText") or ""
+            if not subs:
+                subs = (ch.get("subscriberCountText") or {}).get("simpleText") or ""
+            desc_runs = ((ch.get("descriptionSnippet") or {}).get("runs")) or []
+            desc = "".join(r.get("text", "") for r in desc_runs)
+            thumb = ""
+            t = (ch.get("thumbnail") or {}).get("thumbnails") or []
+            if t:
+                thumb = t[-1].get("url") or ""
+            out.append({
+                "kind": "channel",
+                "id": cid,
+                "url": f"https://www.youtube.com/channel/{cid}",
+                "title": title,
+                "channel": title,
+                "subscribers": subs,
+                "description": desc,
+                "thumbnail": thumb,
+            })
+        except Exception:
+            continue
+    return out
+
+
+def cached_search(query, kind):
+    key = (kind, query.lower().strip())
+    now = time.time()
+    with _search_cache_lock:
+        hit = _search_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    payload = _search_channels(query) if kind == "channel" else _search_videos(query)
+    with _search_cache_lock:
+        _search_cache[key] = (now + _SEARCH_TTL, payload)
+        if len(_search_cache) > 100:
+            for k in list(_search_cache)[:50]:
+                _search_cache.pop(k, None)
+    return payload
+
+
+def _list_channel_videos(channel_id, count=30):
+    """List up to `count` videos from a channel via yt-dlp flat-playlist."""
+    url = f"https://www.youtube.com/channel/{channel_id}/videos"
+    cmd = [
+        "yt-dlp", url,
+        "--flat-playlist", "--dump-json",
+        "--no-warnings", "--skip-download",
+        "--playlist-end", str(count),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        print(f"[channel] timeout for {channel_id}", flush=True)
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = _json.loads(line)
+        except ValueError:
+            continue
+        vid = d.get("id") or ""
+        if not vid:
+            continue
+        thumb = d.get("thumbnail")
+        thumbs = d.get("thumbnails") or []
+        if not thumb and thumbs:
+            thumb = thumbs[-1].get("url")
+        out.append({
+            "kind": "video",
+            "id": vid,
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "title": d.get("title") or "",
+            "channel": d.get("channel") or d.get("uploader") or "",
+            "channel_id": d.get("channel_id") or d.get("uploader_id") or channel_id,
+            "duration_human": _fmt_duration(d.get("duration")),
+            "thumbnail": thumb,
+        })
+    return out
+
+
+def _channel_info(channel_id):
+    """Scrape channel name + avatar from the channel page."""
+    try:
+        r = subprocess.run(
+            ["curl", "-sL", "--max-time", "20",
+             "-H", "Accept-Language: en-US,en;q=0.9",
+             f"https://www.youtube.com/channel/{channel_id}"],
+            capture_output=True, text=True, timeout=25,
+        )
+    except Exception:
+        return {}
+    if r.returncode != 0 or not r.stdout:
+        return {}
+    avatar = ""
+    m = re.search(r'https://yt3\.googleusercontent\.com/[a-zA-Z0-9=_-]+', r.stdout)
+    if m:
+        avatar = m.group(0)
+    title = ""
+    m = re.search(r'"channelMetadataRenderer":\{"title":"([^"]+)"', r.stdout)
+    if m:
+        title = m.group(1)
+    else:
+        m = re.search(r'<meta property="og:title" content="([^"]+)"', r.stdout)
+        if m:
+            title = m.group(1)
+    return {"title": title, "thumbnail": avatar}
+
+
+# ------------------------------------------------------------------
 # yt-dlp auto-update (throttled)
 # ------------------------------------------------------------------
 _last_update = 0.0
@@ -2221,6 +2449,210 @@ SETUP_PAGE = """
 </body></html>
 """
 
+CHANNEL_PAGE = """
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>ytfinall — Channel</title><link rel="icon" type="image/png" href="/static/favicon.png">
+<style>{{ css }}</style>
+<style>
+.s-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+.s-tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+      overflow:hidden;display:flex;flex-direction:column;
+      transition:transform .12s ease,box-shadow .12s ease}
+.s-tile:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
+.s-thumb-wrap{position:relative}
+.s-thumb{aspect-ratio:16/9;width:100%;object-fit:cover;background:var(--surface-2);display:block}
+.s-body{padding:10px 12px;flex-grow:1;display:flex;flex-direction:column}
+.s-title{font-size:.9rem;font-weight:600;line-height:1.35;margin-bottom:4px;
+         display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.s-meta{font-size:.78rem;color:var(--text-muted)}
+.s-actions{margin-top:auto;padding-top:10px}
+.s-actions button{width:100%;padding:8px 12px;font-size:.85rem}
+.s-dur{position:absolute;bottom:8px;right:8px;background:rgba(0,0,0,.85);color:#fff;
+       font-size:.72rem;font-weight:600;padding:2px 6px;border-radius:3px}
+.ch-header{display:flex;gap:16px;align-items:center;padding:18px;
+           background:var(--surface);border:1px solid var(--border);
+           border-radius:var(--radius);margin-bottom:22px}
+.ch-avatar{width:76px;height:76px;border-radius:50%;object-fit:cover;
+           background:var(--surface-2);flex-shrink:0}
+.ch-info{flex-grow:1;min-width:0}
+.ch-name{font-size:1.2rem;font-weight:650;margin:0;line-height:1.25}
+.ch-sub{font-size:.85rem;color:var(--text-muted);margin-top:3px}
+.ch-actions{display:flex;gap:8px;flex-shrink:0}
+.load-wrap{text-align:center;margin:28px 0 0}
+.load-more{padding:12px 32px;font-size:.95rem}
+@media (max-width:520px){
+  .ch-header{flex-wrap:wrap}
+  .ch-info{flex-basis:100%}
+  .ch-actions{width:100%}
+  .ch-actions form,.ch-actions button{width:100%}
+}
+</style></head><body>
+
+<div class="header">
+  <img src="/static/logo.png" alt="ytfinall" class="logo-sm">
+  <div>Logged in as <strong>{{ username }}</strong> — <a href="/logout">Logout</a>
+  {% if is_admin %} — <a href="/settings">Settings</a>{% endif %} — <a href="/">Dashboard</a> — <a href="/search">Search</a></div>
+</div>
+
+<div class="ch-header">
+  {% if channel_avatar %}<img class="ch-avatar" src="{{ channel_avatar }}" alt="">{% endif %}
+  <div class="ch-info">
+    <h2 class="ch-name">{{ channel_title }}</h2>
+    <div class="ch-sub">{{ videos|length }} video(s) loaded</div>
+  </div>
+  <div class="ch-actions">
+    <form method="post" action="/add" style="margin:0">
+      <input type="hidden" name="url" value="https://www.youtube.com/channel/{{ channel_id }}">
+      <input type="hidden" name="retention" value="{{ max_retention }}">
+      <button type="submit">Subscribe</button>
+    </form>
+  </div>
+</div>
+
+{% if not videos %}
+  <p class="small">No videos found, or the channel could not be reached. Try again in a moment.</p>
+{% else %}
+  <div class="s-grid">
+  {% for r in videos %}
+    <div class="s-tile">
+      <div class="s-thumb-wrap">
+        {% if r.thumbnail %}<img class="s-thumb" src="{{ r.thumbnail }}" alt="" loading="lazy">{% endif %}
+        {% if r.duration_human %}<span class="s-dur">{{ r.duration_human }}</span>{% endif %}
+      </div>
+      <div class="s-body">
+        <div class="s-title">{{ r.title }}</div>
+        <div class="s-actions">
+          <form method="post" action="/add" style="margin:0">
+            <input type="hidden" name="url" value="{{ r.url }}">
+            <input type="hidden" name="retention" value="{{ max_retention }}">
+            <button type="submit">Add video</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+
+  {% if has_more %}
+    <div class="load-wrap">
+      <a href="/channel/{{ channel_id }}?count={{ count + 30 }}" style="text-decoration:none">
+        <button type="button" class="load-more">Load 30 more</button>
+      </a>
+    </div>
+  {% endif %}
+{% endif %}
+
+<p class="small" style="margin-top:24px"><a href="/search">← Back to search</a></p>
+</body></html>
+"""
+
+
+SEARCH_PAGE = """
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>ytfinall — Search</title><link rel="icon" type="image/png" href="/static/favicon.png">
+<style>{{ css }}</style>
+<style>
+.search-bar{display:flex;gap:8px;margin:0 0 14px}
+.search-bar input{flex-grow:1;margin:0}
+.tabs{display:flex;gap:4px;margin:0 0 18px;border-bottom:1px solid var(--border)}
+.tab{padding:8px 14px;font-size:.9rem;font-weight:600;color:var(--text-muted);
+     border-bottom:2px solid transparent;margin-bottom:-1px;text-decoration:none}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab:hover{text-decoration:none;color:var(--text)}
+.s-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+.s-tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+      overflow:hidden;display:flex;flex-direction:column;
+      transition:transform .12s ease,box-shadow .12s ease}
+.s-tile:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
+.s-thumb-wrap{position:relative}
+.s-thumb{aspect-ratio:16/9;width:100%;object-fit:cover;background:var(--surface-2);display:block}
+.s-thumb-ch{aspect-ratio:1;width:84px;height:84px;border-radius:50%;
+            object-fit:cover;margin:18px auto 10px;display:block;background:var(--surface-2)}
+.s-body{padding:10px 12px;flex-grow:1;display:flex;flex-direction:column}
+.s-title{font-size:.9rem;font-weight:600;line-height:1.35;margin-bottom:4px;
+         display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.s-meta{font-size:.78rem;color:var(--text-muted)}
+.s-actions{margin-top:auto;padding-top:10px}
+.s-actions button{width:100%;padding:8px 12px;font-size:.85rem}
+.s-dur{position:absolute;bottom:8px;right:8px;background:rgba(0,0,0,.85);color:#fff;
+       font-size:.72rem;font-weight:600;padding:2px 6px;border-radius:3px}
+</style></head><body>
+
+<div class="header">
+  <img src="/static/logo.png" alt="ytfinall" class="logo-sm">
+  <div>Logged in as <strong>{{ username }}</strong> — <a href="/logout">Logout</a>
+  {% if is_admin %} — <a href="/settings">Settings</a>{% endif %} — <a href="/">Dashboard</a></div>
+</div>
+
+<h2>Search YouTube</h2>
+<form method="get" action="/search" class="search-bar">
+  <input name="q" value="{{ q }}" placeholder="Search for a video or channel…" autofocus autocomplete="off">
+  <input type="hidden" name="type" value="{{ kind }}">
+  <button type="submit">Search</button>
+</form>
+
+<div class="tabs">
+  <a class="tab {% if kind=='video' %}active{% endif %}" href="/search?q={{ q|urlencode }}&type=video">Videos</a>
+  <a class="tab {% if kind=='channel' %}active{% endif %}" href="/search?q={{ q|urlencode }}&type=channel">Channels</a>
+</div>
+
+{% if not q %}
+  <p class="small">Type a query above. Results come straight from YouTube.</p>
+{% elif not results %}
+  <p class="small">No {{ kind }} results for <strong>{{ q }}</strong>.</p>
+{% else %}
+  <div class="s-grid">
+  {% for r in results %}
+    <div class="s-tile">
+      {% if r.kind == 'video' %}
+        <div class="s-thumb-wrap">
+          {% if r.thumbnail %}<img class="s-thumb" src="{{ r.thumbnail }}" alt="" loading="lazy">{% endif %}
+          {% if r.duration_human %}<span class="s-dur">{{ r.duration_human }}</span>{% endif %}
+        </div>
+        <div class="s-body">
+          <div class="s-title">{{ r.title }}</div>
+          <div class="s-meta">{{ r.channel }}</div>
+          <div class="s-actions">
+            <form method="post" action="/add" style="margin:0">
+              <input type="hidden" name="url" value="{{ r.url }}">
+              <input type="hidden" name="retention" value="{{ max_retention }}">
+              <button type="submit">Add video</button>
+            </form>
+          </div>
+        </div>
+      {% else %}
+        {% if r.thumbnail %}<img class="s-thumb-ch" src="{{ r.thumbnail }}" alt="" loading="lazy">{% endif %}
+        <div class="s-body" style="text-align:center">
+          <div class="s-title">{{ r.title }}</div>
+          <div class="s-meta">{{ r.subscribers }}</div>
+          <div class="s-actions" style="display:flex;gap:6px">
+            <a href="/channel/{{ r.id }}" style="flex:1;text-decoration:none">
+              <button type="button" style="width:100%;background:#6a7382">Videos</button>
+            </a>
+            <form method="post" action="/add" style="margin:0;flex:1">
+              <input type="hidden" name="url" value="{{ r.url }}">
+              <input type="hidden" name="retention" value="{{ max_retention }}">
+              <button type="submit" style="width:100%">Subscribe</button>
+            </form>
+          </div>
+        </div>
+      {% endif %}
+    </div>
+  {% endfor %}
+  </div>
+
+  {% if has_more %}
+    <div style="text-align:center;margin:28px 0 0">
+      <a href="/search?q={{ q|urlencode }}&type={{ kind }}&count={{ count + 30 }}" style="text-decoration:none">
+        <button type="button" style="padding:12px 32px;font-size:.95rem">Load 30 more</button>
+      </a>
+    </div>
+  {% endif %}
+{% endif %}
+
+<p class="small" style="margin-top:24px"><a href="/">← Back to dashboard</a></p>
+</body></html>
+"""
+
+
 DASHBOARD = """
 <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>ytfinall</title><link rel="icon" type="image/png" href="/static/favicon.png">
 <style>{{ css }}</style></head><body>
@@ -2234,6 +2666,11 @@ DASHBOARD = """
 <p class="small">Admin limits: download from the last <strong>{{ max_lookback }}</strong> days,
 keep media up to <strong>{{ max_retention }}</strong> days.</p>
 </div>
+
+<form method="get" action="/search" style="display:flex;gap:8px;margin:18px 0">
+  <input name="q" placeholder="Search YouTube for videos or channels…" style="margin:0;flex-grow:1" autocomplete="off">
+  <button type="submit">Search</button>
+</form>
 
 <div id="tasks-container" style="display:none;margin:18px 0">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
@@ -3137,6 +3574,86 @@ def index():
         max_retention=max_retention_days(),
         donation_links=DONATION_LINKS,
         donation_message=DONATION_MESSAGE,
+    )
+
+
+@app.route("/search")
+@limiter.limit("30 per minute; 300 per hour")
+def search():
+    if "user_id" not in session:
+        return redirect("/login")
+    q = (request.args.get("q") or "").strip()
+    kind = request.args.get("type") or "video"
+    if kind not in ("video", "channel"):
+        kind = "video"
+
+    try:
+        count = int(request.args.get("count") or 30)
+    except ValueError:
+        count = 30
+    count = max(15, min(count, 300))
+
+    results = []
+    has_more = False
+    if q:
+        if kind == "channel":
+            # YouTube's channel-scrape returns roughly one page; there's
+            # no continuation token without a full player response, so we
+            # just show everything we got in one go.
+            results = _search_channels(q, limit=count)
+        else:
+            # Fetch one extra so we can tell whether more exist.
+            fetched = _search_videos(q, limit=count + 1)
+            has_more = len(fetched) > count
+            results = fetched[:count]
+
+    return render_template_string(
+        SEARCH_PAGE,
+        css=BASE_CSS,
+        q=q,
+        kind=kind,
+        results=results,
+        count=count,
+        has_more=has_more,
+        username=session.get("username", "User"),
+        is_admin=session.get("is_admin", False),
+        max_retention=max_retention_days(),
+    )
+
+
+@app.route("/channel/<channel_id>")
+@limiter.limit("20 per minute; 200 per hour")
+def channel_page(channel_id):
+    if "user_id" not in session:
+        return redirect("/login")
+    if not re.match(r"^[A-Za-z0-9_-]{10,30}$", channel_id):
+        return redirect("/")
+
+    try:
+        count = int(request.args.get("count") or 60)
+    except ValueError:
+        count = 60
+    count = max(30, min(count, 500))
+
+    # Fetch one extra so we can tell if more exist beyond the display cap.
+    # yt-dlp sometimes returns fewer items than requested on a channel page,
+    # so we treat "any results came back and we're under the cap" as has_more.
+    fetched = _list_channel_videos(channel_id, count=count + 1)
+    has_more = len(fetched) > 0 and count < 500
+    videos = fetched[:count]
+    info = _channel_info(channel_id)
+    return render_template_string(
+        CHANNEL_PAGE,
+        css=BASE_CSS,
+        channel_id=channel_id,
+        channel_title=info.get("title") or channel_id,
+        channel_avatar=info.get("thumbnail") or "",
+        videos=videos,
+        count=count,
+        has_more=has_more,
+        username=session.get("username", "User"),
+        is_admin=session.get("is_admin", False),
+        max_retention=max_retention_days(),
     )
 
 
