@@ -279,7 +279,7 @@ A companion browser extension lets you right-click any YouTube video, channel, o
 **Install:**
 
 - **Microsoft Edge Add-ons** — [ytfinall Connector](https://microsoftedge.microsoft.com/addons/detail/ytfinall-connector/hdfpngaekagheekoajkjhdjoomppmlhj)
-- **Firefox Add-ons (AMO)** — pending review
+- **Firefox Add-ons (AMO)** — [ytfinall Connector](https://addons.mozilla.org/en-GB/firefox/addon/ytfinall-connector/)
 - **Chrome** — manual install required (Chrome Web Store policy). See [INSTALL_CHROME.md](INSTALL_CHROME.md) for step-by-step instructions.
 
 **Works on:**
