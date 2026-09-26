@@ -2367,6 +2367,16 @@ tr:hover td{background:var(--surface-2)}
   .donate-link{width:100%;text-align:center}
   .card{padding:14px 16px}
 }
+
+details > summary::-webkit-details-marker{display:none}
+details > summary::marker{display:none}
+details[open] > summary{
+  border-bottom-left-radius:0;
+  border-bottom-right-radius:0;
+  border-bottom-color:transparent;
+}
+details[open] > summary span:last-child::after{content:" ▲"}
+details:not([open]) > summary span:last-child::after{content:" ▼"}
 """
 
 LOGIN_PAGE = """
@@ -2717,7 +2727,15 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 
 
 
-<h3>Add a one-off video</h3>
+<details style="margin:28px 0">
+<summary style="cursor:pointer;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-weight:600;list-style:none;display:flex;justify-content:space-between;align-items:center;user-select:none">
+  <span>Add manually</span>
+  <span class="small" style="font-weight:400">paste a URL</span>
+</summary>
+
+<div style="padding:4px 0 0 0">
+
+<h3 style="margin-top:22px">Add a one-off video</h3>
 <form method="post" action="/add">
   <div class="field-group">
     <label>Video URL</label>
@@ -2810,6 +2828,9 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 
   <button type="submit" style="margin-top: 10px;">Add &amp; Download</button>
 </form>
+
+</div>
+</details>
 
 <h3>Your sources</h3>
 <div style="overflow-x:auto">
