@@ -137,6 +137,7 @@ this inside the container:
 find /media/users -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | while read f; do
   [ -f "$f.ytfinall.json" ] || echo "{\"source_id\":null}" > "$f.ytfinall.json"
 done
+```
 - Real-time monitoring enabled
 - Users keep access to their existing Jellyfin libraries
 - Users never see each other's ytfinall libraries
