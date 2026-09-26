@@ -7,8 +7,9 @@
 # ytfinall
 
 A companion web app for Jellyfin. Users log in with their Jellyfin
-account, add YouTube channels or one-off videos, and get them downloaded
-into a private Jellyfin library that only they can see.
+account, search YouTube without leaving the app, and add channels or
+one-off videos that get downloaded into a private Jellyfin library
+that only they can see.
 
 ### ↔️ Project Gallery (Scroll horizontally)
 
@@ -23,6 +24,9 @@ into a private Jellyfin library that only they can see.
 ## Highlights
 
 - First-run setup wizard — no config files to edit
+- **In-app YouTube search** — find videos and channels without copy-pasting URLs
+- **Paginated channel browse** — see a channel's uploads before subscribing
+- **Auto-delete after watching** — Jellyfin tells ytfinall when a video is finished, and it's removed
 - Per-user Jellyfin libraries; users keep their existing movies, TV, and music
 - Admin-defined lookback window (how far back users can download)
 - Admin-defined maximum retention (how long media stays before deletion)
@@ -35,6 +39,23 @@ into a private Jellyfin library that only they can see.
   <br>
   <em>Custom animated GIF poster applied to each user's library</em>
 </p>
+
+## In-app search
+
+The dashboard has a search bar that queries YouTube directly.
+
+- **Videos tab** — up to 300 results with "Load 30 more" pagination
+- **Channels tab** — the first page of channel results, each with a
+  **Videos** button that opens a paginated browse page
+- One-click **Add video** / **Subscribe** on any result — feeds straight
+  into the download pipeline
+- Channel browse pages start at 60 videos and load 30 more per click,
+  capped at 500
+- Results are cached for 5 minutes to keep YouTube happy on repeated
+  searches
+
+Search uses `yt-dlp`'s built-in `ytsearch` for videos and lightweight
+HTML scraping for channels. No API key required.
 
 ## Sources
 
@@ -62,9 +83,62 @@ into a private Jellyfin library that only they can see.
   from Jellyfin too
 - Deleting a library in Jellyfin and logging in again recreates it
 
-## Jellyfin integration
+## Auto-delete after watching
 
-- Creates a private `ytfinall - <username>` library on first login
+Optional per-user toggle on the dashboard. When enabled, Jellyfin
+notifies ytfinall the moment a video is watched to completion, and the
+file is removed from disk.
+
+- Only fires when Jellyfin reports `PlayedToCompletion=true` —
+  stopping halfway, pausing, or closing the player does nothing
+- Deletion also removes the `.nfo`, `.info.json`, and ytfinall's own
+  `.ytfinall.json` marker
+- Videos are matched against ytfinall's ownership marker — files
+  without one are never touched, so non-ytfinall media under the same
+  mount is safe
+- Falls back to the retention scheduler for anything you don't watch
+
+**Setup requires the Jellyfin [Webhook plugin](https://github.com/jellyfin/jellyfin-plugin-webhook).**
+Full instructions appear on ytfinall's admin settings page. The short
+version:
+
+1. In Jellyfin, install the Webhook plugin and add a **Generic**
+   destination (not **Generic Form** — that one always sends
+   form-encoded data)
+2. Paste the URL ytfinall shows on its settings page (includes a
+   `?token=...` for authentication)
+3. Tick only **Playback Stop** under Notification Type and only
+   **Episodes** under Item Type
+4. Leave all users unticked — the app decides per-user
+5. Add a Request Header with key `Content-Type` and value
+   `application/json`
+6. Paste the JSON template shown on the settings page into the
+   Template field
+7. Save, then restart Jellyfin (the plugin only reloads destination
+   config on restart)
+
+Recent versions of the Webhook plugin leave `{{Path}}` and
+`{{UserName}}` empty in the template payload. ytfinall handles this
+automatically — it looks the user up from `UserId` and finds the file
+by matching the title in the user's library folder.
+
+## Ownership markers
+
+Every download is tagged with a `.ytfinall.json` sidecar that records
+the source it came from. This serves two purposes:
+
+- **Retention** — each file is evaluated against its own source's
+  retention period, not a global default
+- **Safe deletion** — the webhook and cleanup pass refuse to delete
+  any file without a marker
+
+Files downloaded before v1.1 don't have markers. To backfill them, run
+this inside the container:
+
+```bash
+find /media/users -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.m4v" \) | while read f; do
+  [ -f "$f.ytfinall.json" ] || echo "{\"source_id\":null}" > "$f.ytfinall.json"
+done
 - Real-time monitoring enabled
 - Users keep access to their existing Jellyfin libraries
 - Users never see each other's ytfinall libraries
@@ -228,6 +302,10 @@ A companion browser extension lets you right-click any YouTube video, channel, o
 
     Videos are always limited to the admin's lookback window. A user's
     per-source cutoff can be tighter, never wider.
+
+    Auto-delete requires the Jellyfin Webhook plugin and a one-time
+    destination setup. Until the webhook is configured, files simply
+    stay on disk until retention expires.
 
     Retention is capped by the admin's maximum. Users can request shorter
     retention, never longer.

@@ -3230,12 +3230,33 @@ SETTINGS_PAGE = """
     http://YOUR-SERVER-IP:6842/jellyfin/webhook?token={{ webhook_secret() }}
   </div>
   <p class="small" style="margin-top:10px">
-    Replace <code>YOUR-SERVER-IP</code> with the address Jellyfin uses to reach this container (e.g. <code>192.168.1.10</code>, or the container name if on the same Docker network).<br>
-    <strong>Notification type:</strong> enable only <strong>Playback Stop</strong>.<br>
-    <strong>Payload format:</strong> JSON.<br>
-    <strong>Template:</strong> leave default.
+    Replace <code>YOUR-SERVER-IP</code> with the address Jellyfin uses to reach this container (e.g. <code>192.168.1.10</code>, or the container name if on the same Docker network).
   </p>
-  <p class="small"><strong>Path note:</strong> the <code>Path</code> field Jellyfin sends must live under <code>{{ media_root_display }}</code> as seen from <em>this</em> container. If Jellyfin mounts the same media folder at a different path, deletions will be refused (check the Live Logs panel for <code>[webhook] refusing…</code> lines).</p>
+
+  <p class="small" style="margin-top:14px"><strong>Configure the destination like this:</strong></p>
+  <ul class="small" style="margin:6px 0 0 0;padding-left:20px;line-height:1.7">
+    <li><strong>Destination type:</strong> <code>Generic</code> (do <em>not</em> use <code>Generic Form</code> — it always sends form-encoded data and ignores both the template and headers)</li>
+    <li><strong>Notification Type:</strong> tick only <strong>Playback Stop</strong></li>
+    <li><strong>Item Type:</strong> tick only <strong>Episodes</strong></li>
+    <li><strong>User Filter:</strong> leave all users unticked (fires for everyone — ytfinall decides per-user)</li>
+    <li><strong>Send All Properties:</strong> leave <strong>UNCHECKED</strong></li>
+    <li><strong>Request Header:</strong> add a row with key <code>Content-Type</code> and value <code>application/json</code></li>
+    <li><strong>Template:</strong> paste this exactly (the Handlebars variables are populated by the plugin):
+      <pre style="background:#f4f6f8;padding:10px;border-radius:4px;font-size:12px;overflow-x:auto;margin:6px 0 0 0">{
+  "NotificationType": "{{NotificationType}}",
+  "PlayedToCompletion": "{{PlayedToCompletion}}",
+  "UserId": "{{UserId}}",
+  "UserName": "{{UserName}}",
+  "Path": "{{Path}}",
+  "Name": "{{Name}}"
+}</pre>
+    </li>
+    <li><strong>After saving:</strong> restart the Jellyfin container — the plugin only reloads destination config on restart</li>
+  </ul>
+
+  <p class="small" style="margin-top:14px"><strong>Path &amp; user note:</strong> recent versions of the Webhook plugin leave <code>{{Path}}</code> and <code>{{UserName}}</code> empty in the template payload. ytfinall handles this automatically — it looks up the user from <code>UserId</code> and finds the file by matching the video title in the user's library folder. You should see a working <code>[webhook]</code> line in the Live Logs panel within a second of finishing a video.</p>
+
+  <p class="small">If deletion is refused, check the Live Logs panel for a <code>[webhook] refusing…</code> line — it will say whether the path was outside the media root or the file was missing its <code>.ytfinall.json</code> marker.</p>
 </div>
 
 <div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
