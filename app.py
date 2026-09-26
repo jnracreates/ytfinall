@@ -160,24 +160,9 @@ try:
 except Exception as _e:
     print(f"[startup] staging cleanup error: {_e}")
 
-# On startup, any download_task that isn't in a terminal state is
-# orphaned — the process that was running it no longer exists. Mark
-# them failed with a clear message so the user can clear them from
-# the dashboard instead of seeing ghost "active" entries.
-try:
-    with db() as _conn:
-        _cur = _conn.execute(
-            "UPDATE download_tasks SET status='failed', "
-            "message='Interrupted by server restart', "
-            "finished_at=? "
-            "WHERE status NOT IN ('complete', 'failed')",
-            (_now_iso(),),
-        )
-        if _cur.rowcount:
-            print(f"[startup] cleared {_cur.rowcount} orphaned task(s)",
-                  flush=True)
-except Exception as _e:
-    print(f"[startup] task cleanup error: {_e}")
+# Note: the download_tasks cleanup that used to run here was moved into
+# init_db(), which already does the same thing once the DB layer is up.
+# Running it here failed because db() isn't defined yet at this point.
 
 # Persist the Flask session secret so logins survive restarts.
 _secret_path = "/app-data/secret.key"
@@ -224,12 +209,17 @@ def init_db():
                 user_id TEXT PRIMARY KEY,
                 username TEXT,
                 library_id TEXT,
-                is_admin INTEGER DEFAULT 0
+                is_admin INTEGER DEFAULT 0,
+                delete_on_finish INTEGER DEFAULT 0
             )
         """)
-        # Idempotent migration for DBs created before is_admin existed.
+        # Idempotent migrations for DBs created before these columns existed.
         try:
             conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN delete_on_finish INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         # Opaque tokens issued to the browser extension. Only hashes
@@ -356,6 +346,26 @@ def jellyfin_url():
 
 def jellyfin_api_key():
     return get_config("jellyfin_api_key", "")
+
+
+def webhook_secret():
+    """Shared secret appended to the Jellyfin webhook URL.
+
+    Generated once and stored in the config table. Jellyfin's Webhook plugin
+    doesn't support custom headers on every version, so the token rides in
+    the query string.
+    """
+    s = get_config("webhook_secret")
+    if not s:
+        import secrets
+        s = secrets.token_urlsafe(24)
+        set_config("webhook_secret", s)
+    return s
+
+
+# Expose to templates so SETTINGS_PAGE can render the URL without every
+# render_template_string() call having to pass it explicitly.
+app.jinja_env.globals["webhook_secret"] = webhook_secret
 
 
 def max_lookback_days():
@@ -1802,19 +1812,21 @@ def _run_download_locked(user_id, url, custom_name=None, cutoff_date=None):
             shutil.rmtree(staging_dir, ignore_errors=True)
 
         # Tag each freshly-moved file with the source it came from, so
-        # cleanup can apply this source's retention to it later.
-        if source_id is not None:
-            import json as _json
-            for _dst in _staged_paths:
-                if not os.path.exists(_dst):
-                    continue
-                _marker = _dst + ".ytfinall.json"
-                try:
-                    with open(_marker, "w") as _mf:
-                        _json.dump({"source_id": source_id}, _mf)
-                except OSError as _me:
-                    print(f"[retention] marker write failed for "
-                          f"{_dst}: {_me}", flush=True)
+        # cleanup can apply this source's retention to it later, and so
+        # the Jellyfin webhook can prove the file belongs to ytfinall
+        # before deleting it. Every ytfinall download gets a marker,
+        # even if the source lookup failed.
+        import json as _json
+        for _dst in _staged_paths:
+            if not os.path.exists(_dst):
+                continue
+            _marker = _dst + ".ytfinall.json"
+            try:
+                with open(_marker, "w") as _mf:
+                    _json.dump({"source_id": source_id}, _mf)
+            except OSError as _me:
+                print(f"[retention] marker write failed for "
+                      f"{_dst}: {_me}", flush=True)
 
         # Trim long YouTube descriptions to a short synopsis
         try:
@@ -1986,8 +1998,13 @@ def scheduler_loop():
                     rows = conn.execute(
                         "SELECT user_id FROM users"
                     ).fetchall()
+                # retention_days isn't a users column — it lives on
+                # sources. cleanup_user_media reads each source's own
+                # retention from the DB; the second arg is only a
+                # fallback for users with no sources left.
+                fallback = max_retention_days()
                 for row in rows:
-                    cleanup_user_media(row["user_id"], row["retention_days"])
+                    cleanup_user_media(row["user_id"], fallback)
             except Exception as e:
                 print(f"[scheduler] cleanup error: {e}")
             last_cleanup = now
@@ -2667,6 +2684,24 @@ DASHBOARD = """
 keep media up to <strong>{{ max_retention }}</strong> days.</p>
 </div>
 
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+    <div>
+      <strong>Auto-delete after watching</strong>
+      <p class="small" style="margin:4px 0 0">
+        {% if delete_on_finish %}
+          <span style="color:var(--success)">● Enabled</span> — videos are removed once you finish watching them in Jellyfin.
+        {% else %}
+          <span style="color:var(--text-muted)">● Disabled</span> — videos stay until their retention period expires.
+        {% endif %}
+      </p>
+    </div>
+    <form method="post" action="/toggle-delete-on-finish" style="margin:0">
+      <button type="submit">{% if delete_on_finish %}Disable{% else %}Enable{% endif %}</button>
+    </form>
+  </div>
+</div>
+
 <form method="get" action="/search" style="display:flex;gap:8px;margin:18px 0">
   <input name="q" placeholder="Search YouTube for videos or channels…" style="margin:0;flex-grow:1" autocomplete="off">
   <button type="submit">Search</button>
@@ -3189,6 +3224,21 @@ SETTINGS_PAGE = """
 </div>
 
 <div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
+  <label>Jellyfin Webhook — auto-delete after watching</label>
+  <p class="small">Users can toggle auto-delete on their dashboard. For it to fire, Jellyfin must be configured to POST to this endpoint. In Jellyfin, install the <strong>Webhook</strong> plugin, add a <strong>Generic Destination</strong>, and paste this URL:</p>
+  <div style="background:#111;color:#0f0;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:12px;padding:12px;border-radius:6px;word-break:break-all;margin-top:6px">
+    http://YOUR-SERVER-IP:6842/jellyfin/webhook?token={{ webhook_secret() }}
+  </div>
+  <p class="small" style="margin-top:10px">
+    Replace <code>YOUR-SERVER-IP</code> with the address Jellyfin uses to reach this container (e.g. <code>192.168.1.10</code>, or the container name if on the same Docker network).<br>
+    <strong>Notification type:</strong> enable only <strong>Playback Stop</strong>.<br>
+    <strong>Payload format:</strong> JSON.<br>
+    <strong>Template:</strong> leave default.
+  </p>
+  <p class="small"><strong>Path note:</strong> the <code>Path</code> field Jellyfin sends must live under <code>{{ media_root_display }}</code> as seen from <em>this</em> container. If Jellyfin mounts the same media folder at a different path, deletions will be refused (check the Live Logs panel for <code>[webhook] refusing…</code> lines).</p>
+</div>
+
+<div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
   <label>Live logs</label>
   <p class="small">Updates every 2 seconds while this tab is visible. Shows the last 500 lines.</p>
   <div id="log-box" style="background:#111;color:#0f0;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:12px;padding:12px;border-radius:6px;height:320px;overflow-y:auto;white-space:pre-wrap;line-height:1.35;word-break:break-all">Loading…</div>
@@ -3564,6 +3614,10 @@ def index():
             "SELECT * FROM sources WHERE user_id=? ORDER BY id DESC",
             (session["user_id"],),
         ).fetchall()
+        urow = conn.execute(
+            "SELECT delete_on_finish FROM users WHERE user_id=?",
+            (session["user_id"],),
+        ).fetchone()
     return render_template_string(
         DASHBOARD,
         css=BASE_CSS,
@@ -3572,6 +3626,7 @@ def index():
         is_admin=session.get("is_admin", False),
         max_lookback=max_lookback_days(),
         max_retention=max_retention_days(),
+        delete_on_finish=bool(urow and urow["delete_on_finish"]),
         donation_links=DONATION_LINKS,
         donation_message=DONATION_MESSAGE,
     )
@@ -3859,6 +3914,128 @@ def upload_cookies():
     return {"ok": True, "message": f"Saved cookies.txt ({len(raw)} bytes)."}
 
 
+@app.route("/jellyfin/webhook", methods=["POST"])
+def jellyfin_webhook():
+    """Receive PlaybackStop events from the Jellyfin Webhook plugin.
+
+    Configure Jellyfin with the full URL including ?token=... so random
+    traffic can't trigger deletions.
+    """
+    import hmac as _hmac
+    expected = webhook_secret()
+    token = request.args.get("token", "")
+    if not token or not _hmac.compare_digest(token, expected):
+        return {"status": "error", "message": "unauthorized"}, 403
+
+    data = request.get_json(silent=True)
+    if not data:
+        return {"status": "error", "message": "no json"}, 400
+
+    if data.get("NotificationType") != "PlaybackStop":
+        return {"status": "ignored", "reason": "not a stop event"}, 200
+    p2c = str(data.get("PlayedToCompletion", "")).strip().lower()
+    if p2c not in ("true", "1", "yes"):
+        return {"status": "ignored", "reason": "not played to completion"}, 200
+
+    raw_user_id = data.get("UserId") or ""
+    item_path = data.get("Path") or ""
+    item_name = data.get("Name") or "?"
+    username = data.get("UserName") or ""
+
+    if not raw_user_id:
+        return {"status": "error", "message": "missing UserId"}, 400
+
+    # Match the Jellyfin UUID to our stored no-dash form.
+    urow = _find_user_row(raw_user_id)
+    if not urow:
+        print(f"[webhook] unknown user_id from Jellyfin: {raw_user_id}", flush=True)
+        return {"status": "ignored", "message": "unknown user"}, 200
+
+    # Use the stored form for all downstream lookups.
+    user_id = urow["user_id"]
+    if not username:
+        username = urow["username"] or user_id
+
+    # Some Jellyfin Webhook plugin versions don't populate {{Path}} in
+    # the template. When that happens, search the user's media folder
+    # for a file matching the title.
+    if not item_path:
+        item_path = _find_media_by_name(user_id, item_name)
+        if not item_path:
+            print(f"[webhook] could not locate media for {item_name!r} "
+                  f"(user {user_id})", flush=True)
+            return {"status": "error",
+                    "message": "no Path in payload and lookup failed"}, 404
+
+    if not urow["delete_on_finish"]:
+        return {"status": "ok", "message": "auto-delete disabled for this user"}, 200
+
+    # Path safety: only delete inside MEDIA_ROOT.
+    real_root = os.path.realpath(MEDIA_ROOT)
+    real_path = os.path.realpath(item_path)
+    if not real_path.startswith(real_root + os.sep):
+        print(f"[webhook] refusing to delete outside media root: {real_path}", flush=True)
+        return {"status": "error", "message": "path not under media root"}, 400
+
+    # Ownership safety: only delete files ytfinall downloaded. The
+    # .ytfinall.json sidecar is written by the download pipeline and
+    # by nothing else, so its presence proves the file is ours.
+    # Videos with no marker are either legacy downloads or came from
+    # some other source entirely — leave them alone.
+    marker = real_path + ".ytfinall.json"
+    if not os.path.exists(marker):
+        print(f"[webhook] refusing to delete unmarked file: {real_path}", flush=True)
+        return {"status": "ignored",
+                "reason": "no ytfinall marker alongside file"}, 200
+
+    if not os.path.exists(real_path):
+        return {"status": "ok", "message": "already gone"}, 200
+
+    deleted = []
+    try:
+        os.remove(real_path)
+        deleted.append(os.path.basename(real_path))
+        base, _ = os.path.splitext(real_path)
+        # NFO and info.json sit alongside the file as sibling basenames
+        # (video.nfo), while the ytfinall marker appends to the full
+        # filename including extension (video.mp4.ytfinall.json).
+        for side in (
+            base + ".nfo",
+            base + ".info.json",
+            real_path + ".ytfinall.json",
+        ):
+            if os.path.exists(side):
+                os.remove(side)
+                deleted.append(os.path.basename(side))
+    except OSError as e:
+        print(f"[webhook] delete failed for {real_path}: {e}", flush=True)
+        return {"status": "error", "message": "delete failed"}, 500
+
+    print(f"[webhook] {username} finished {item_name!r} — removed {deleted}", flush=True)
+
+    with db() as conn:
+        lrow = conn.execute(
+            "SELECT library_id FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if lrow and lrow["library_id"]:
+        refresh_jellyfin_library(lrow["library_id"])
+
+    return {"status": "ok", "message": "deleted", "files": deleted}, 200
+
+
+@app.route("/toggle-delete-on-finish", methods=["POST"])
+def toggle_delete_on_finish():
+    if "user_id" not in session:
+        return redirect("/login")
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET delete_on_finish = 1 - COALESCE(delete_on_finish, 0) "
+            "WHERE user_id=?",
+            (session["user_id"],),
+        )
+    return redirect("/")
+
+
 @app.route("/admin/logs/clear", methods=["POST"])
 def admin_logs_clear():
     if "user_id" not in session or not session.get("is_admin"):
@@ -4097,6 +4274,65 @@ def api_tasks():
 def _hash_token(raw: str) -> str:
     import hashlib
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _normalize_user_id(uid):
+    """Jellyfin sends UUIDs with dashes; ytfinall stores them without.
+
+    Normalize to lowercase, no-dash form for comparisons.
+    """
+    return (uid or "").replace("-", "").lower()
+
+
+def _find_user_row(user_id):
+    """Look up a user by ID regardless of dashed/undashed format."""
+    norm = _normalize_user_id(user_id)
+    with db() as conn:
+        return conn.execute(
+            "SELECT user_id, username, delete_on_finish FROM users "
+            "WHERE REPLACE(LOWER(user_id), '-', '') = ?",
+            (norm,),
+        ).fetchone()
+
+
+def _find_media_by_name(user_id, name):
+    """Locate a media file in the user's library by fuzzy-matching the title.
+
+    Used as a fallback when Jellyfin's webhook payload lacks a Path field.
+    ytfinall's filenames always contain the video title, so a substring
+    match on the sanitized title finds it reliably.
+    """
+    if not name:
+        return ""
+    row = _find_user_row(user_id)
+    if not row or not row["username"]:
+        return ""
+    username = safe_username(row["username"])
+    root = f"{MEDIA_ROOT}/{username}/shows"
+    if not os.path.isdir(root):
+        return ""
+
+    # Strip filesystem-illegal chars the same way yt-dlp does when writing.
+    needle = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).lower().strip()
+    if not needle:
+        return ""
+
+    media_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v"}
+    matches = []
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            if os.path.splitext(f)[1].lower() not in media_exts:
+                continue
+            if needle in f.lower():
+                matches.append(os.path.join(dirpath, f))
+
+    if not matches:
+        return ""
+    if len(matches) == 1:
+        return matches[0]
+    # Multiple matches — prefer the most recently modified.
+    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return matches[0]
 
 
 def issue_api_token(user_id: str, username: str, ttl_days: int = 30) -> str:
