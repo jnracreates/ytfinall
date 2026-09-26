@@ -4004,10 +4004,13 @@ def jellyfin_webhook():
     if not item_path:
         item_path = _find_media_by_name(user_id, item_name)
         if not item_path:
-            print(f"[webhook] could not locate media for {item_name!r} "
-                  f"(user {user_id})", flush=True)
-            return {"status": "error",
-                    "message": "no Path in payload and lookup failed"}, 404
+            # Either the video was already deleted (Jellyfin still has
+            # the item cached and keeps sending stop events), or it was
+            # never downloaded by ytfinall. Either way, nothing to do.
+            print(f"[webhook] nothing to delete for {item_name!r} "
+                  f"(already gone or never downloaded)", flush=True)
+            return {"status": "ignored",
+                    "message": "no matching media on disk"}, 200
 
     if not urow["delete_on_finish"]:
         return {"status": "ok", "message": "auto-delete disabled for this user"}, 200
@@ -4038,12 +4041,13 @@ def jellyfin_webhook():
         os.remove(real_path)
         deleted.append(os.path.basename(real_path))
         base, _ = os.path.splitext(real_path)
-        # NFO and info.json sit alongside the file as sibling basenames
-        # (video.nfo), while the ytfinall marker appends to the full
-        # filename including extension (video.mp4.ytfinall.json).
+        # NFO, info.json, and webp sit alongside the file as sibling
+        # basenames (video.nfo), while the ytfinall marker appends to
+        # the full filename including extension (video.mp4.ytfinall.json).
         for side in (
             base + ".nfo",
             base + ".info.json",
+            base + ".webp",
             real_path + ".ytfinall.json",
         ):
             if os.path.exists(side):
@@ -4341,8 +4345,11 @@ def _find_media_by_name(user_id, name):
     """Locate a media file in the user's library by fuzzy-matching the title.
 
     Used as a fallback when Jellyfin's webhook payload lacks a Path field.
-    ytfinall's filenames always contain the video title, so a substring
-    match on the sanitized title finds it reliably.
+    Jellyfin reports titles with their original punctuation (e.g. '?'),
+    while yt-dlp writes them to disk after sanitization — the two never
+    match byte-for-byte. We normalize both sides by stripping every
+    non-alphanumeric character, which makes the comparison immune to
+    punctuation differences.
     """
     if not name:
         return ""
@@ -4354,9 +4361,11 @@ def _find_media_by_name(user_id, name):
     if not os.path.isdir(root):
         return ""
 
-    # Strip filesystem-illegal chars the same way yt-dlp does when writing.
-    needle = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).lower().strip()
-    if not needle:
+    def _norm(s):
+        return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+    needle = _norm(name)
+    if len(needle) < 5:
         return ""
 
     media_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v"}
@@ -4365,7 +4374,8 @@ def _find_media_by_name(user_id, name):
         for f in files:
             if os.path.splitext(f)[1].lower() not in media_exts:
                 continue
-            if needle in f.lower():
+            stem = os.path.splitext(f)[0]
+            if needle in _norm(stem):
                 matches.append(os.path.join(dirpath, f))
 
     if not matches:
