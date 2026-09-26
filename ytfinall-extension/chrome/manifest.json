@@ -1,16 +1,15 @@
 {
   "manifest_version": 3,
   "name": "ytfinall Connector",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Send YouTube videos and channels to your ytfinall library. Works on desktop and mobile.",
   "permissions": [
     "contextMenus",
     "storage",
     "activeTab"
   ],
-  "host_permissions": [
-    "http://*:6842/*",
-    "https://*:6842/*"
+   "host_permissions": [
+    "*://*/*"
   ],
   "background": {
     "service_worker": "background.js"

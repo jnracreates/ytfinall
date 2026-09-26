@@ -1,8 +1,27 @@
 const browser = globalThis.browser ?? globalThis.chrome;
 const $ = (id) => document.getElementById(id);
 
+// Accept "example.com", "http://example.com", "example.com/", etc. and
+// return a canonical "http://example.com" with no trailing slash.
+// Defaults to http:// because ytfinall serves plain HTTP on port 6842.
+// Users on HTTPS type https:// themselves and it's respected.
+function normalizeServerUrl(raw) {
+    let s = (raw || '').trim();
+    if (!s) return '';
+    if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+    return s.replace(/\/+$/, '');
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
     const data = await browser.storage.local.get(['jellyfinToken', 'username', 'backendUrl']);
+    // Repair any URL stored before normalization existed.
+    if (data.backendUrl) {
+        const fixed = normalizeServerUrl(data.backendUrl);
+        if (fixed && fixed !== data.backendUrl) {
+            data.backendUrl = fixed;
+            await browser.storage.local.set({ backendUrl: fixed });
+        }
+    }
     if (data.jellyfinToken && data.username) {
         showSendView(data.username);
         try {
@@ -34,7 +53,7 @@ function showLoginView() {
 }
 
 async function doLogin() {
-    const backendUrl = $('backendUrl').value.trim().replace(/\/+$/, '');
+    const backendUrl = normalizeServerUrl($('backendUrl').value);
     const username = $('username').value.trim();
     const password = $('password').value;
     if (!backendUrl || !username || !password) {

@@ -22,11 +22,25 @@ if (browser.contextMenus) {
 
 // --- Shared Download Function ---
 // This is used by both the desktop context menu and the mobile popup.
+function normalizeServerUrl(raw) {
+  let s = (raw || '').trim();
+  if (!s) return '';
+  if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+  return s.replace(/\/+$/, '');
+}
+
 async function queueDownload(url) {
   const data = await browser.storage.local.get(['jellyfinToken', 'backendUrl']);
   if (!data.jellyfinToken || !data.backendUrl) {
     console.error("Not logged in. Open the extension popup first.");
     return { ok: false, error: "Not logged in" };
+  }
+
+  // Repair legacy URLs missing a scheme.
+  const fixed = normalizeServerUrl(data.backendUrl);
+  if (fixed && fixed !== data.backendUrl) {
+    data.backendUrl = fixed;
+    await browser.storage.local.set({ backendUrl: fixed });
   }
 
   try {

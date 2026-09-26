@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ytfinall Connector",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Send YouTube videos and channels to your ytfinall library. Works on desktop and mobile.",
   "permissions": [
     "contextMenus",
@@ -9,11 +9,10 @@
     "activeTab"
   ],
   "host_permissions": [
-    "http://*:6842/*",
-    "https://*:6842/*"
+    "*://*/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "scripts": ["background.js"]
   },
   "action": {
     "default_popup": "popup.html",
@@ -27,7 +26,10 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "ytfinall-connector@jnracreates.local",
-      "strict_min_version": "128.0"
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": ["authenticationInfo"]
+      }
     },
     "gecko_android": {}
   }
