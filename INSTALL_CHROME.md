@@ -259,7 +259,7 @@ it affects every browser extension with this functionality. The same
 extension is available on:
 
 - **Microsoft Edge Add-ons:** [install link](https://microsoftedge.microsoft.com/addons/detail/ytfinall-connector/hdfpngaekagheekoajkjhdjoomppmlhj)
-- **Firefox Add-ons (AMO):** pending review
+- **Firefox Add-ons (AMO):** [ytfinall Connector](https://addons.mozilla.org/en-GB/firefox/addon/ytfinall-connector/)
 - **Chrome:** manual install (this document)
 
 If you use Chrome and want a one-click install from a store, you can
