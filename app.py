@@ -2832,6 +2832,17 @@ keep media up to <strong>{{ max_retention }}</strong> days.</p>
 </div>
 </details>
 
+<div class="card" style="display:flex;align-items:center;gap:14px;padding:14px 20px">
+  <div style="font-size:24px;line-height:1">📺</div>
+  <div>
+    <div style="font-weight:600;margin-bottom:2px">Your videos live in Jellyfin</div>
+    <p class="small" style="margin:0">
+      Open Jellyfin and look under <strong style="color:var(--text)">My Media → ytfinall - {{ username }}</strong>.
+      New downloads appear there automatically within minutes of finishing.
+    </p>
+  </div>
+</div>
+
 <h3>Your sources</h3>
 <div style="overflow-x:auto">
 <table>
