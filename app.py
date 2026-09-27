@@ -2513,6 +2513,7 @@ CHANNEL_PAGE = """
 .s-title{font-size:.9rem;font-weight:600;line-height:1.35;margin-bottom:4px;
          display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .s-meta{font-size:.78rem;color:var(--text-muted)}
+.s-date{color:var(--text-faint);font-size:.9em;font-weight:400;margin-left:4px}
 .s-actions{margin-top:auto;padding-top:10px}
 .s-actions button{width:100%;padding:8px 12px;font-size:.85rem}
 .s-dur{position:absolute;bottom:8px;right:8px;background:rgba(0,0,0,.85);color:#fff;
@@ -2619,6 +2620,7 @@ SEARCH_PAGE = """
 .s-title{font-size:.9rem;font-weight:600;line-height:1.35;margin-bottom:4px;
          display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .s-meta{font-size:.78rem;color:var(--text-muted)}
+.s-date{color:var(--text-faint);font-size:.9em;font-weight:400;margin-left:4px}
 .s-actions{margin-top:auto;padding-top:10px}
 .s-actions button{width:100%;padding:8px 12px;font-size:.85rem}
 .s-dur{position:absolute;bottom:8px;right:8px;background:rgba(0,0,0,.85);color:#fff;
@@ -2648,6 +2650,33 @@ SEARCH_PAGE = """
 {% elif not results %}
   <p class="small">No {{ kind }} results for <strong>{{ q }}</strong>.</p>
 {% else %}
+  <script>
+  document.addEventListener('DOMContentLoaded', function () {
+    var queue = Array.prototype.slice.call(document.querySelectorAll('.s-date'));
+    var CONCURRENCY = 4;
+    var running = 0;
+
+    function pump() {
+      while (running < CONCURRENCY && queue.length) {
+        var el = queue.shift();
+        var vid = el.getAttribute('data-vid');
+        if (!vid || el.dataset.loaded) continue;
+        el.dataset.loaded = '1';
+        running++;
+        (function (el, vid) {
+          fetch('/api/video-date/' + encodeURIComponent(vid))
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              if (d && d.date) el.textContent = ' · ' + d.date;
+            })
+            .catch(function () {})
+            .finally(function () { running--; pump(); });
+        })(el, vid);
+      }
+    }
+    pump();
+  });
+  </script>
   <div class="s-grid">
   {% for r in results %}
     <div class="s-tile">
@@ -2658,7 +2687,7 @@ SEARCH_PAGE = """
         </div>
         <div class="s-body">
           <div class="s-title">{{ r.title }}</div>
-          <div class="s-meta">{{ r.channel }}</div>
+          <div class="s-meta">{{ r.channel }}<span class="s-date" data-vid="{{ r.id }}"></span></div>
           <div class="s-actions">
             <form method="post" action="/add" style="margin:0">
               <input type="hidden" name="url" value="{{ r.url }}">
@@ -3707,6 +3736,35 @@ def index():
     )
 
 
+_video_date_cache = {}
+
+
+@app.route("/api/video-date/<video_id>")
+def api_video_date(video_id):
+    """Return the upload date for one YouTube video, cached in memory."""
+    if "user_id" not in session:
+        return {"date": None}, 403
+    if video_id in _video_date_cache:
+        return {"date": _video_date_cache[video_id]}, 200
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--print", "%(upload_date)s", "--skip-download",
+             "--no-warnings", "--extractor-args",
+             "youtube:player_client=android,web_embedded,-visionos",
+             f"https://www.youtube.com/watch?v={video_id}"],
+            capture_output=True, text=True, timeout=20,
+        )
+        raw = result.stdout.strip().split("\n")[0]
+        if raw and raw != "NA" and len(raw) == 8 and raw.isdigit():
+            date = f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+        else:
+            date = None
+    except Exception:
+        date = None
+    _video_date_cache[video_id] = date
+    return {"date": date}, 200
+
+
 @app.route("/search")
 @limiter.limit("30 per minute; 300 per hour")
 def search():
@@ -4012,9 +4070,10 @@ def jellyfin_webhook():
     if p2c not in ("true", "1", "yes"):
         return {"status": "ignored", "reason": "not played to completion"}, 200
 
+    import html as _html
     raw_user_id = data.get("UserId") or ""
     item_path = data.get("Path") or ""
-    item_name = data.get("Name") or "?"
+    item_name = _html.unescape(data.get("Name") or "?")
     username = data.get("UserName") or ""
 
     if not raw_user_id:
