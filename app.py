@@ -85,6 +85,8 @@ class _TeeStdout:
             self._pending = combined
             return
         *complete, self._pending = combined.split("\n")
+        import time as _time
+        ts = _time.strftime("%H:%M:%S")
         with _log_lock:
             for line in complete:
                 line = line.rstrip()
@@ -96,13 +98,15 @@ class _TeeStdout:
                 # to the admin UI. Raw stdout still gets the original.
                 redacted = re.sub(r"(\?|&)[^\s]*", r"\1<redacted>", line)
                 redacted = re.sub(r'Token="[^"]+"', 'Token="<redacted>"', redacted)
-                _log_buffer.append(redacted)
+                _log_buffer.append(f"[{ts}] {redacted}")
 
     def flush(self):
         # Emit any dangling partial line so it isn't lost on shutdown
         if self._pending.strip():
+            import time as _time
+            ts = _time.strftime("%H:%M:%S")
             with _log_lock:
-                _log_buffer.append(self._pending)
+                _log_buffer.append(f"[{ts}] {self._pending}")
             self._pending = ""
         try:
             self.original.flush()
@@ -4001,7 +4005,9 @@ def jellyfin_webhook():
     # Match the Jellyfin UUID to our stored no-dash form.
     urow = _find_user_row(raw_user_id)
     if not urow:
-        print(f"[webhook] unknown user_id from Jellyfin: {raw_user_id}", flush=True)
+        # Unknown user_id — likely a user who hasn't logged into ytfinall
+        # yet, or a Jellyfin service account. Silently ignore; the row is
+        # created on their next ytfinall login.
         return {"status": "ignored", "message": "unknown user"}, 200
 
     # Use the stored form for all downstream lookups.
