@@ -2189,6 +2189,24 @@ a:hover{text-decoration:underline}
   margin:18px 0;
   box-shadow:var(--shadow-sm);
 }
+.user-maint-card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  padding:12px 16px;
+  margin:10px 0;
+}
+.code-block{
+  background:var(--surface-2);
+  color:var(--text);
+  border:1px solid var(--border);
+  border-radius:var(--radius-sm);
+  padding:10px;
+  font-size:12px;
+  font-family:var(--mono);
+  overflow-x:auto;
+  margin:6px 0 0 0;
+}
 
 table{
   width:100%;
@@ -3214,7 +3232,7 @@ SETTINGS_PAGE = """
   <p class="small">Clear a user's download archive to force yt-dlp to re-download their library. Useful after data loss or for a full rebuild.</p>
 
   {% for u in user_list %}
-  <div style="background:#f7f9fb;border:1px solid #e1e6eb;border-radius:6px;padding:12px 16px;margin:10px 0">
+  <div class="user-maint-card">
     <strong>{{ u.username }}</strong>
     <span class="small" style="margin-left:8px">
       — {{ u.sources }} sources, {{ u.archive_count }} archived videos
@@ -3278,7 +3296,7 @@ SETTINGS_PAGE = """
     <li><strong>Send All Properties:</strong> leave <strong>UNCHECKED</strong></li>
     <li><strong>Request Header:</strong> add a row with key <code>Content-Type</code> and value <code>application/json</code></li>
     <li><strong>Template:</strong> paste this exactly (the Handlebars variables are populated by the plugin):
-      <pre style="background:#f4f6f8;padding:10px;border-radius:4px;font-size:12px;overflow-x:auto;margin:6px 0 0 0">{
+      <pre class="code-block">{
   "NotificationType": "{{NotificationType}}",
   "PlayedToCompletion": "{{PlayedToCompletion}}",
   "UserId": "{{UserId}}",
