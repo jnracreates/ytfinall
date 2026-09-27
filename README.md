@@ -316,11 +316,12 @@ A companion browser extension lets you right-click any YouTube video, channel, o
     its ID stays in the archive — the video will not be re-downloaded
     unless the archive is cleared.
 
-### License
-
 ## License
 
 [MIT](LICENSE)
+
+## Related projects
+**[Subtitle Extract Plus](https://github.com/jnracreates/subtitle-extract-plus)** — a fork of the official Subtitle Extract plugin with language filtering, forced-track selection, and save-with-media
 
 ## Support this project
 
