@@ -524,8 +524,15 @@ def _fmt_duration(seconds):
 
 def _search_videos(query, limit=15):
     """yt-dlp ytsearch in flat-playlist mode. No download, no resolve."""
+    import urllib.parse as _urlparse
+    search_url = (
+        "https://www.youtube.com/results?search_query="
+        + _urlparse.quote(query)
+        + "&sp=CAI%3D"
+    )
     cmd = [
-        "yt-dlp", f"ytsearch{limit}:{query}",
+        "yt-dlp", search_url,
+        "--playlist-end", str(limit),
         "--flat-playlist", "--dump-json",
         "--no-warnings", "--skip-download",
         "--extractor-args",
@@ -2561,6 +2568,60 @@ CHANNEL_PAGE = """
 {% if not videos %}
   <p class="small">No videos found, or the channel could not be reached. Try again in a moment.</p>
 {% else %}
+  <script>
+  document.addEventListener('DOMContentLoaded', function () {
+    var queue = Array.prototype.slice.call(document.querySelectorAll('.s-date'));
+    var CONCURRENCY = 4;
+    var running = 0;
+    var completed = 0;
+    var total = queue.length;
+    var grid = document.querySelector('.s-grid');
+
+    function sortGrid() {
+      if (!grid) return;
+      var tiles = Array.prototype.slice.call(grid.querySelectorAll('.s-tile'));
+      tiles.sort(function (a, b) {
+        var da = a.querySelector('.s-date');
+        var db = b.querySelector('.s-date');
+        var va = (da && da.dataset.iso) || '';
+        var vb = (db && db.dataset.iso) || '';
+        if (!va && !vb) return 0;
+        if (!va) return 1;
+        if (!vb) return -1;
+        return vb.localeCompare(va);
+      });
+      tiles.forEach(function (t) { grid.appendChild(t); });
+    }
+
+    function pump() {
+      while (running < CONCURRENCY && queue.length) {
+        var el = queue.shift();
+        var vid = el.getAttribute('data-vid');
+        if (!vid || el.dataset.loaded) continue;
+        el.dataset.loaded = '1';
+        running++;
+        (function (el, vid) {
+          fetch('/api/video-date/' + encodeURIComponent(vid))
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              if (d && d.date) {
+                el.textContent = ' · ' + d.date;
+                el.dataset.iso = d.date;
+              }
+            })
+            .catch(function () {})
+            .finally(function () {
+              running--;
+              completed++;
+              if (completed === total) sortGrid();
+              pump();
+            });
+        })(el, vid);
+      }
+    }
+    pump();
+  });
+  </script>
   <div class="s-grid">
   {% for r in videos %}
     <div class="s-tile">
@@ -2570,6 +2631,7 @@ CHANNEL_PAGE = """
       </div>
       <div class="s-body">
         <div class="s-title">{{ r.title }}</div>
+        <div class="s-meta"><span class="s-date" data-vid="{{ r.id }}"></span></div>
         <div class="s-actions">
           <form method="post" action="/add" style="margin:0">
             <input type="hidden" name="url" value="{{ r.url }}">
@@ -2655,6 +2717,25 @@ SEARCH_PAGE = """
     var queue = Array.prototype.slice.call(document.querySelectorAll('.s-date'));
     var CONCURRENCY = 4;
     var running = 0;
+    var completed = 0;
+    var total = queue.length;
+    var grid = document.querySelector('.s-grid');
+
+    function sortGrid() {
+      if (!grid) return;
+      var tiles = Array.prototype.slice.call(grid.querySelectorAll('.s-tile'));
+      tiles.sort(function (a, b) {
+        var da = a.querySelector('.s-date');
+        var db = b.querySelector('.s-date');
+        var va = (da && da.dataset.iso) || '';
+        var vb = (db && db.dataset.iso) || '';
+        if (!va && !vb) return 0;
+        if (!va) return 1;      // undated tiles go last
+        if (!vb) return -1;
+        return vb.localeCompare(va);  // descending by date
+      });
+      tiles.forEach(function (t) { grid.appendChild(t); });
+    }
 
     function pump() {
       while (running < CONCURRENCY && queue.length) {
@@ -2667,10 +2748,18 @@ SEARCH_PAGE = """
           fetch('/api/video-date/' + encodeURIComponent(vid))
             .then(function (r) { return r.json(); })
             .then(function (d) {
-              if (d && d.date) el.textContent = ' · ' + d.date;
+              if (d && d.date) {
+                el.textContent = ' · ' + d.date;
+                el.dataset.iso = d.date;
+              }
             })
             .catch(function () {})
-            .finally(function () { running--; pump(); });
+            .finally(function () {
+              running--;
+              completed++;
+              if (completed === total) sortGrid();
+              pump();
+            });
         })(el, vid);
       }
     }
