@@ -323,6 +323,10 @@ A companion browser extension lets you right-click any YouTube video, channel, o
 ## Related projects
 **[Subtitle Extract Plus](https://github.com/jnracreates/subtitle-extract-plus)** — a fork of the official Subtitle Extract plugin with language filtering, forced-track selection, and save-with-media
 
+Also check out Bulk User Manager for Jellyfin 12 — mass edit user settings, permissions, and defaults with one-click backup and restore.
+
+https://github.com/jnracreates/bulk-user-manager
+
 ## Support this project
 
 If you find ytfinall useful and want to say thanks:
