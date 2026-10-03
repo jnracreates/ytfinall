@@ -1,5 +1,6 @@
 import os, sqlite3, subprocess, threading, time, datetime, requests, shutil, re
 from flask import Flask, request, redirect, render_template_string, session, jsonify, abort
+from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -237,6 +238,12 @@ def init_db():
                 expires_at TEXT
             )
         """)
+        # Migration: add library override column if it doesn't exist
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN library_override_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # already exists
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS download_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -342,6 +349,21 @@ def set_config(key, value):
 
 def is_configured():
     return bool(get_config("jellyfin_api_key"))
+
+
+def get_settings_password_hash():
+    return get_config("settings_password_hash", "")
+
+
+def set_settings_password(password):
+    set_config("settings_password_hash", generate_password_hash(password))
+
+
+def check_settings_password(password):
+    h = get_settings_password_hash()
+    if not h:
+        return False
+    return check_password_hash(h, password)
 
 
 def jellyfin_url():
@@ -480,6 +502,43 @@ def _fmt_bytes(n):
             return f"{n:.2f} {unit}" if unit != "B" else f"{int(n)} B"
         n /= 1024
     return f"{n:.2f} TB"
+
+
+def _build_library_users():
+    """Return per-user data for the library-assignment UI."""
+    result = []
+    with db() as conn:
+        users = conn.execute(
+            "SELECT user_id, username FROM users"
+        ).fetchall()
+    libs_by_id = {l["id"]: l["name"] for l in list_jellyfin_libraries()}
+    for u in users:
+        raw_override = None
+        with db() as conn2:
+            r2 = conn2.execute(
+                "SELECT library_override_id FROM users WHERE user_id=?",
+                (u["user_id"],)
+            ).fetchone()
+        if r2:
+            try:
+                raw_override = r2["library_override_id"] or None
+            except (IndexError, KeyError):
+                raw_override = None
+        if raw_override:
+            current = libs_by_id.get(raw_override, f"(missing: {raw_override[:8]}...)")
+        elif get_default_library_id():
+            dname = libs_by_id.get(get_default_library_id(), "?")
+            current = f"{dname} (inherited default)"
+        else:
+            current = f"ytfinall - {u['username'] or u['user_id']}"
+        override_id = raw_override
+        result.append({
+            "user_id": u["user_id"],
+            "username": u["username"] or u["user_id"],
+            "override_id": override_id,
+            "current_library_name": current,
+        })
+    return result
 
 
 def build_user_list():
@@ -813,6 +872,39 @@ def jellyfin_login(username, password):
     return None, None
 
 
+def get_default_library_id():
+    return get_config("default_library_id", "")
+
+
+def set_default_library_id(lib_id):
+    set_config("default_library_id", lib_id or "")
+
+
+def get_user_library_override(user_id):
+    """Return the library this user should be routed to.
+
+    Precedence: per-user override > global default > None (auto-create).
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT library_override_id FROM users WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+    if row:
+        try:
+            if row["library_override_id"]:
+                return row["library_override_id"]
+        except (IndexError, KeyError):
+            pass
+    return get_default_library_id() or None
+
+
+def list_assignable_libraries():
+    """Return non-ytfinall libraries the admin can assign a user to."""
+    return [l for l in list_jellyfin_libraries()
+            if not l["name"].startswith(YT_LIB_PREFIX)]
+
+
 def list_jellyfin_libraries():
     """Return [{id, name}, ...] for all virtual folders using ItemId safely."""
     api_key = jellyfin_api_key()
@@ -1088,6 +1180,72 @@ def ensure_user_library(user_id, username):
                 )
             print(f"[jellyfin] recovered existing library by name: "
                   f"{lib_name} -> {my_lib_id}", flush=True)
+
+    # --- Admin override: route this user's downloads into an existing
+    # Jellyfin library instead of their own auto-created one.
+    override_id = get_user_library_override(user_id)
+    if override_id:
+        all_libs = list_jellyfin_libraries()
+        override_lib = next((l for l in all_libs if l["id"] == override_id), None)
+        if not override_lib:
+            print(f"[jellyfin] override library {override_id} no longer exists, "
+                  f"clearing override for {username}", flush=True)
+            with db() as conn:
+                conn.execute(
+                    "UPDATE users SET library_override_id=NULL, library_id=NULL "
+                    "WHERE user_id=?", (user_id,)
+                )
+            override_id = None
+
+    if override_id:
+        override_name = override_lib["name"]
+        user_shows = f"{MEDIA_ROOT}/{safe_name}/shows"
+        os.makedirs(user_shows, exist_ok=True)
+
+        existing_paths = []
+        try:
+            r = requests.get(
+                f"{url}/Library/VirtualFolders",
+                headers=headers, timeout=15,
+            )
+            for lib in r.json():
+                if lib.get("ItemId") == override_id:
+                    existing_paths = lib.get("Locations") or []
+                    break
+        except Exception:
+            pass
+
+        if user_shows not in existing_paths:
+            new_paths = existing_paths + [user_shows]
+            try:
+                r = requests.post(
+                    f"{url}/Library/VirtualFolders/Paths",
+                    json={
+                        "Name": override_name,
+                        "PathInfos": [{"Path": p} for p in new_paths],
+                    },
+                    headers=headers, timeout=15,
+                )
+                if r.status_code not in (200, 204):
+                    print(f"[jellyfin] could not add path to override library "
+                          f"{override_name} ({r.status_code}). Add "
+                          f"{user_shows} manually in Jellyfin → Dashboard → "
+                          f"Libraries.", flush=True)
+                else:
+                    print(f"[jellyfin] added {user_shows} to {override_name}",
+                          flush=True)
+            except Exception as e:
+                print(f"[jellyfin] path add error for {override_name}: {e}",
+                      flush=True)
+
+        with db() as conn:
+            conn.execute(
+                "UPDATE users SET library_id=? WHERE user_id=?",
+                (override_id, user_id),
+            )
+        print(f"[jellyfin] {username} uses override library: {override_name}",
+              flush=True)
+        return override_id
 
     if not my_lib_id:
         os.makedirs(user_shows, exist_ok=True)
@@ -2489,6 +2647,18 @@ SETUP_PAGE = """
   </div>
 
   <div class="field-group">
+    <label>Admin password (for unlocking settings)</label>
+    <div class="input-row">
+      <input name="settings_password" type="password" required minlength="8" placeholder="At least 8 characters">
+      <label for="setup-password" class="info-btn">ⓘ Info</label>
+    </div>
+    <input type="checkbox" id="setup-password" class="info-toggle">
+    <div class="info-box">
+      <strong>Why this matters:</strong> The settings page controls ytfinall's behavior. This password locks it. You'll enter it every time you visit Settings. Choose something you don't use anywhere else.
+    </div>
+  </div>
+
+  <div class="field-group">
     <label>Maximum retention (days)</label>
     <div class="input-row">
       <input name="max_retention_days" type="number" min="1" max="3650" value="{{ max_retention }}" required>
@@ -3147,9 +3317,9 @@ SETTINGS_PAGE = """
 {% if ok %}<p class="ok">{{ ok }}</p>{% endif %}
 
 {% if locked %}
-  <p>Enter the current Jellyfin API key to unlock settings.</p>
+  <p>Enter the admin password to unlock settings.</p>
   <form method="post" action="/settings">
-    <input name="unlock_key" placeholder="Current API key" required>
+    <input name="unlock_key" type="password" placeholder="Admin password" required autofocus>
     <button type="submit">Unlock</button>
   </form>
 {% else %}
@@ -3343,6 +3513,36 @@ SETTINGS_PAGE = """
 
     <button type="submit" style="margin-top: 10px;">Save</button>
   </form>
+
+  {% if not has_settings_password %}
+  <div class="error" style="margin-top:18px">
+    <strong>No admin password set.</strong> Anyone with admin access to this app can edit settings without a password. Set one below.
+  </div>
+  {% endif %}
+
+  <div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
+    <label>Change admin password</label>
+    <p class="small">Used to unlock this settings page. Independent of your Jellyfin account.</p>
+    {% if password_error %}<p class="error">{{ password_error }}</p>{% endif %}
+    {% if password_ok %}<p class="ok">{{ password_ok }}</p>{% endif %}
+    <form method="post" action="/settings/change-password">
+      {% if has_settings_password %}
+      <div class="field-group">
+        <label>Current password</label>
+        <input name="current_password" type="password" required>
+      </div>
+      {% endif %}
+      <div class="field-group">
+        <label>New password (min 8 chars)</label>
+        <input name="new_password" type="password" required minlength="8">
+      </div>
+      <div class="field-group">
+        <label>Confirm new password</label>
+        <input name="confirm_password" type="password" required minlength="8">
+      </div>
+      <button type="submit">Change password</button>
+    </form>
+  </div>
 {% endif %}
 
 <div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
@@ -3372,6 +3572,45 @@ SETTINGS_PAGE = """
     <div class="admin-archive-status" data-uid="{{ u.user_id }}" style="margin-top:8px;font-size:13px"></div>
   </div>
   {% endfor %}
+</div>
+
+<div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
+  <label>Default library</label>
+  <p class="small">Applied to every user without an explicit per-user assignment. Leave as <em>(default)</em> to give each user their own auto-created <code>ytfinall - &lt;username&gt;</code> library.</p>
+  <form method="post" action="/settings/default-library" style="display:flex;gap:8px;align-items:center">
+    <select name="library_id" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text)">
+      <option value="">(default — per-user libraries)</option>
+      {% for lib in assignable_libraries %}
+      <option value="{{ lib.id }}" {% if lib.id == default_library_id %}selected{% endif %}>{{ lib.name }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" style="padding:8px 16px">Save</button>
+  </form>
+</div>
+
+<div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
+  <label>Per-user library assignment</label>
+  <p class="small">By default each user gets their own library named <code>ytfinall - &lt;username&gt;</code>. Assign a user to an existing Jellyfin library to have their downloads appear there instead.</p>
+
+  {% if library_users %}
+    {% for u in library_users %}
+    <div class="user-maint-card" style="margin-bottom:10px">
+      <strong>{{ u.username }}</strong>
+      <span class="small" style="margin-left:8px">— currently: {{ u.current_library_name }}</span>
+      <form method="post" action="/settings/user-library/{{ u.user_id }}" style="display:flex;gap:8px;margin-top:10px;align-items:center">
+        <select name="library_id" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text)">
+          <option value="">{% if default_library_id %}(inherit default){% else %}(default — own library){% endif %}</option>
+          {% for lib in assignable_libraries %}
+          <option value="{{ lib.id }}" {% if lib.id == u.override_id %}selected{% endif %}>{{ lib.name }}</option>
+          {% endfor %}
+        </select>
+        <button type="submit" style="padding:8px 16px">Save</button>
+      </form>
+    </div>
+    {% endfor %}
+  {% else %}
+    <p class="small">No users yet.</p>
+  {% endif %}
 </div>
 
 <div class="field-group" style="margin-top:24px;border-top:1px solid #ddd;padding-top:18px">
@@ -3783,10 +4022,19 @@ def setup():
                 error=f"Could not reach Jellyfin with that key: {e}",
             )
 
+        settings_password = (request.form.get("settings_password") or "").strip()
+        if len(settings_password) < 8:
+            return render_template_string(
+                SETUP_PAGE, css=BASE_CSS,
+                jf_url=jf_url, max_lookback=lookback, max_retention=retention,
+                error="Admin password must be at least 8 characters.",
+            )
+
         set_config("jellyfin_url", jf_url)
         set_config("jellyfin_api_key", api_key)
         set_config("max_lookback_days", lookback)
         set_config("max_retention_days", retention)
+        set_settings_password(settings_password)
         return redirect("/login")
 
     return render_template_string(
@@ -4291,6 +4539,50 @@ def admin_logs():
     return {"lines": lines}, 200
 
 
+@app.route("/settings/default-library", methods=["POST"])
+def settings_set_default_library():
+    if "user_id" not in session or not session.get("is_admin"):
+        return redirect("/login")
+    if not session.get("settings_unlocked") and get_settings_password_hash():
+        return redirect("/settings")
+
+    chosen = (request.form.get("library_id") or "").strip()
+    set_default_library_id(chosen)
+    if chosen:
+        print(f"[admin] default library set to {chosen}", flush=True)
+    else:
+        print("[admin] default library cleared", flush=True)
+    return redirect("/settings")
+
+
+@app.route("/settings/user-library/<user_id>", methods=["POST"])
+def settings_set_user_library(user_id):
+    if "user_id" not in session or not session.get("is_admin"):
+        return redirect("/login")
+    if not session.get("settings_unlocked") and get_settings_password_hash():
+        return redirect("/settings")
+
+    chosen = (request.form.get("library_id") or "").strip()
+
+    with db() as conn:
+        if chosen:
+            conn.execute(
+                "UPDATE users SET library_override_id=?, library_id=NULL "
+                "WHERE user_id=?", (chosen, user_id)
+            )
+            print(f"[admin] user {user_id} assigned to library {chosen}",
+                  flush=True)
+        else:
+            conn.execute(
+                "UPDATE users SET library_override_id=NULL, library_id=NULL "
+                "WHERE user_id=?", (user_id,)
+            )
+            print(f"[admin] cleared library override for {user_id}",
+                  flush=True)
+
+    return redirect("/settings")
+
+
 @app.route("/admin/user-stats")
 def admin_user_stats():
     """Return video count + storage for each user. Admin only."""
@@ -4377,6 +4669,53 @@ def require_admin():
         abort(403)
 
 
+@app.route("/settings/change-password", methods=["POST"])
+def settings_change_password():
+    if "user_id" not in session or not session.get("is_admin"):
+        return redirect("/login")
+    if not session.get("settings_unlocked") and get_settings_password_hash():
+        return redirect("/settings")
+
+    current = request.form.get("current_password", "")
+    new = request.form.get("new_password", "")
+    confirm = request.form.get("confirm_password", "")
+
+    def render_settings(error=None, ok=None):
+        return render_template_string(
+            SETTINGS_PAGE, css=BASE_CSS, locked=False,
+            jf_url=jellyfin_url(), api_key=jellyfin_api_key(),
+            user_list=build_user_list(),
+            library_users=_build_library_users(),
+            assignable_libraries=list_assignable_libraries(),
+            default_library_id=get_default_library_id(),
+            has_settings_password=bool(get_settings_password_hash()),
+            max_lookback=max_lookback_days(),
+            max_retention=max_retention_days(),
+            playlist_end=playlist_end(),
+            sleep_requests=sleep_requests(),
+            sleep_interval=sleep_interval(),
+            max_sleep_interval=max_sleep_interval(),
+            max_resolution=max_resolution(),
+            media_container=media_container(),
+            outtmpl=outtmpl_setting(),
+            extra_ytdlp_args=get_config("extra_ytdlp_args", ""),
+            index_interval_hours=index_interval_hours(),
+            cleanup_interval_hours=cleanup_interval_hours(),
+            cookies_present=os.path.exists(COOKIES_FILE),
+            password_error=error, password_ok=ok,
+        )
+
+    if get_settings_password_hash() and not check_settings_password(current):
+        return render_settings(error="Current password is wrong.")
+    if len(new) < 8:
+        return render_settings(error="New password must be at least 8 characters.")
+    if new != confirm:
+        return render_settings(error="New passwords don't match.")
+
+    set_settings_password(new)
+    return render_settings(ok="Password updated.")
+
+
 @app.route("/settings", methods=["GET", "POST"])
 def settings():
     if "user_id" not in session:
@@ -4386,17 +4725,24 @@ def settings():
 
     locked = not session.get("settings_unlocked")
 
+    # No password set yet? Let the admin in so they can set one.
+    if not get_settings_password_hash():
+        locked = False
+
     if request.method == "POST":
         if locked:
             entered = request.form.get("unlock_key", "").strip()
-            if entered == jellyfin_api_key():
+            if check_settings_password(entered):
                 session["settings_unlocked"] = True
                 return redirect("/settings")
             return render_template_string(
                 SETTINGS_PAGE, css=BASE_CSS, locked=True,
-                error="That key doesn't match.",
+                error="That password doesn't match.",
                 jf_url=jellyfin_url(), api_key="",
                 user_list=[],
+                library_users=[], assignable_libraries=[],
+                default_library_id="",
+                has_settings_password=bool(get_settings_password_hash()),
                 max_lookback=max_lookback_days(),
                 max_retention=max_retention_days(),
                 playlist_end=playlist_end(),
@@ -4438,6 +4784,10 @@ def settings():
             SETTINGS_PAGE, css=BASE_CSS, locked=False,
             jf_url=jellyfin_url(), api_key=jellyfin_api_key(),
             user_list=build_user_list(),
+            library_users=_build_library_users(),
+            assignable_libraries=list_assignable_libraries(),
+            default_library_id=get_default_library_id(),
+            has_settings_password=bool(get_settings_password_hash()),
             max_lookback=max_lookback_days(),
             max_retention=max_retention_days(),
             playlist_end=playlist_end(),
@@ -4459,6 +4809,10 @@ def settings():
         jf_url=jellyfin_url(),
         api_key=jellyfin_api_key() if not locked else "",
         user_list=build_user_list() if not locked else [],
+        library_users=_build_library_users() if not locked else [],
+        assignable_libraries=list_assignable_libraries() if not locked else [],
+        default_library_id=get_default_library_id() if not locked else "",
+        has_settings_password=bool(get_settings_password_hash()) if not locked else False,
         max_lookback=max_lookback_days(),
         max_retention=max_retention_days(),
         playlist_end=playlist_end(),
