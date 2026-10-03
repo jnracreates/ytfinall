@@ -31,6 +31,8 @@ that only they can see.
 - Drag-and-drop cookies.txt upload from the admin settings page
 - yt-dlp auto-updates to nightly on container start and per request
 - Atomic staging → library move — Jellyfin never sees partial files
+- Shared library routing — admins can send users' downloads to an existing Jellyfin library instead of forcing per-user ones
+- Admin settings password — protects the settings page independently of your Jellyfin account
 
 <p align="center">
   <img width="120" alt="default-cover" src="https://github.com/user-attachments/assets/28f44d89-21cf-4cff-aedf-2726a3c846e1" />
