@@ -1302,24 +1302,40 @@ def ensure_user_library(user_id, username):
     try:
         all_libs = list_jellyfin_libraries()
 
-        visible_ids = []
-        for lib in all_libs:
-            if lib["name"].startswith(YT_LIB_PREFIX):
-                if lib["id"] == str(my_lib_id):
-                    visible_ids.append(lib["id"])
-            else:
-                visible_ids.append(lib["id"])
+        # Build the visible list:
+        #   1. Preserve every library the user already had access to,
+        #      except other users' ytfinall libraries.
+        #   2. Always add their own ytfinall library.
+        #   3. If they previously had implicit "all libraries" access,
+        #      expand that into an explicit list of non-ytfinall libraries.
+        my_id = str(my_lib_id)
+        existing = set(str(i) for i in (policy.get("EnabledFolders") or []))
+        was_all_folders = bool(policy.get("EnableAllFolders"))
 
-        existing = set(str(i) for i in policy.get("EnabledFolders") or [])
-        for lib_id in existing:
-            if lib_id in visible_ids:
-                continue
-            match = next((l for l in all_libs if l["id"] == lib_id), None)
-            if match and not match["name"].startswith(YT_LIB_PREFIX):
-                visible_ids.append(lib_id)
+        visible = set()
+
+        if was_all_folders:
+            # User implicitly saw everything. Convert to an explicit list
+            # of all non-ytfinall libraries.
+            for lib in all_libs:
+                if not lib["name"].startswith(YT_LIB_PREFIX):
+                    visible.add(lib["id"])
+        else:
+            # Preserve exactly what they already had, minus other users'
+            # ytfinall libraries.
+            for lib_id in existing:
+                match = next((l for l in all_libs if l["id"] == lib_id), None)
+                if not match:
+                    continue
+                if match["name"].startswith(YT_LIB_PREFIX) and match["id"] != my_id:
+                    continue
+                visible.add(lib_id)
+
+        # Always ensure their own ytfinall library is included.
+        visible.add(my_id)
 
         policy["EnableAllFolders"] = False
-        policy["EnabledFolders"] = visible_ids
+        policy["EnabledFolders"] = sorted(visible)
 
         update_resp = requests.post(
             f"{url}/Users/{user_id}/Policy",
@@ -1337,17 +1353,20 @@ def ensure_user_library(user_id, username):
 def refresh_jellyfin_library(lib_id):
     api_key = jellyfin_api_key()
     if not lib_id or not api_key:
+        print(f"[jellyfin] refresh skipped (lib_id={lib_id!r}, key={'set' if api_key else 'missing'})", flush=True)
         return
     try:
-        requests.post(
+        r = requests.post(
             f"{jellyfin_url()}/Items/{lib_id}/Refresh",
             params={"Recursive": "true",
                     "ImageRefreshMode": "Default",
-                    "MetadataRefreshMode": "Default"},
+                    "MetadataRefreshMode": "Default",
+                    "ReplaceAllMetadata": "false"},
             headers={"Authorization": f'MediaBrowser Token="{api_key}"'}, timeout=20,
         )
+        print(f"[jellyfin] refresh {lib_id[:8]}... -> HTTP {r.status_code}", flush=True)
     except Exception as e:
-        print(f"[jellyfin] refresh error: {e}")
+        print(f"[jellyfin] refresh error: {e}", flush=True)
 
 
 # ------------------------------------------------------------------
